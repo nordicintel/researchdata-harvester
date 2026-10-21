@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: NOASSERTION
 # Copyright (c) 2026 NordicIntel
-"""Split oversized staged Parquet files before committing; run with Python -m."""
+"""Split staged Parquet/JSONL files, including gzip wrappers, before committing."""
 
 import argparse
+import gzip
 import math
 import os
 import shutil
@@ -10,6 +11,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import zlib
+from contextlib import ExitStack
+from itertools import islice
 from pathlib import Path
 
 import duckdb
@@ -25,11 +29,32 @@ def git(root: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
+def data_suffix(path: Path) -> str:
+    """Recognize complete suffixes while preserving the original spelling."""
+    for suffix in (".parquet.gz", ".jsonl.gz", ".parquet", ".jsonl"):
+        if path.name.lower().endswith(suffix):
+            return path.name[-len(suffix) :]
+    return ""
+
+
 def split_file(source: Path, directory: Path, maximum: int, target: int) -> list[Path]:
-    """Divide rows evenly using source bytes as the initial size estimate."""
-    with duckdb.connect(config={"threads": 1}) as connection:
-        relation = connection.read_parquet(str(source))
-        rows = relation.count("*").fetchall()[0][0]
+    """Divide rows evenly; gzip limits apply to compressed file sizes."""
+    suffix = data_suffix(source).lower()
+    compressed = suffix.endswith(".gz")
+    plain = source
+    if compressed:
+        plain = directory / ("unpacked" + suffix[:-3])
+        with gzip.open(source, "rb") as content, plain.open("wb") as output:
+            shutil.copyfileobj(content, output)
+    with ExitStack() as stack:
+        relation = None
+        if suffix.startswith(".parquet"):
+            connection = stack.enter_context(duckdb.connect(config={"threads": 1}))
+            relation = connection.read_parquet(str(plain))
+            rows = relation.count("*").fetchall()[0][0]
+        else:
+            with plain.open("rb") as content:
+                rows = sum(1 for _ in content)
         if rows < 2:
             raise ValueError(
                 f"{source.name}: fewer than two rows; cannot split safely."
@@ -38,14 +63,30 @@ def split_file(source: Path, directory: Path, maximum: int, target: int) -> list
         while True:
             parts = []
             offset = 0
-            for index in range(count):
-                length = rows // count + (index < rows % count)
-                part = directory / f"part_{index + 1}.parquet"
-                relation.limit(length, offset).write_parquet(
-                    str(part), compression="zstd"
-                )
-                parts.append(part)
-                offset += length
+            with plain.open("rb") as content:
+                for index in range(count):
+                    length = rows // count + (index < rows % count)
+                    part = directory / f"part_{index + 1}{suffix}"
+                    raw_part = part.with_suffix("") if compressed else part
+                    if relation is not None:
+                        relation.limit(length, offset).write_parquet(
+                            str(raw_part), compression="zstd"
+                        )
+                    else:
+                        with raw_part.open("wb") as output:
+                            output.writelines(islice(content, length))
+                    if compressed:
+                        with (
+                            raw_part.open("rb") as input_file,
+                            part.open("wb") as output,
+                        ):
+                            with gzip.GzipFile(
+                                filename="", mode="wb", fileobj=output, mtime=0
+                            ) as archive:
+                                shutil.copyfileobj(input_file, archive)
+                        raw_part.unlink()
+                    parts.append(part)
+                    offset += length
             largest = max(part.stat().st_size for part in parts)
             if largest < maximum:
                 return parts
@@ -75,7 +116,7 @@ def split_staged(root: Path, maximum: int, target: int) -> int:
         if not raw:
             continue
         name = os.fsdecode(raw)
-        if Path(name).suffix.lower() != ".parquet":
+        if not data_suffix(Path(name)):
             continue
         oid = git(root, "rev-parse", f":{name}").decode().strip()
         if int(git(root, "cat-file", "-s", oid)) < maximum:
@@ -103,7 +144,8 @@ def split_staged(root: Path, maximum: int, target: int) -> int:
             directory = Path(temporary) / str(index)
             directory.mkdir()
             source = root / name
-            backup = directory / "source.parquet"
+            suffix = data_suffix(source)
+            backup = directory / ("source" + suffix)
             shutil.copyfile(source, backup)
             if (
                 git(root, "hash-object", "--no-filters", str(backup)).decode().strip()
@@ -112,7 +154,7 @@ def split_staged(root: Path, maximum: int, target: int) -> int:
                 raise ValueError(f"{name}: file changed while preparing the split.")
             parts = split_file(backup, directory, maximum, target)
             destinations = [
-                source.with_name(f"{source.stem}_part_{i + 1}{source.suffix}")
+                source.with_name(f"{source.name[: -len(suffix)]}_part_{i + 1}{suffix}")
                 for i in range(len(parts))
             ]
             for destination in destinations:
@@ -232,7 +274,14 @@ def main() -> int:
             raise ValueError("Sizes must satisfy 0 < target_mb < max_mb (decimal MB).")
         split_staged(root, maximum, target)
         return 0
-    except (RuntimeError, ValueError, OSError, duckdb.Error) as error:
+    except (
+        RuntimeError,
+        ValueError,
+        OSError,
+        EOFError,
+        zlib.error,
+        duckdb.Error,
+    ) as error:
         print(f"parquet-hook: {error}", file=sys.stderr)
         return 1
 

@@ -8,6 +8,8 @@ data/current/*
 !data/current/*.json
 !data/current/*.jsonl.gz
 !data/current/*.parquet
+!data/current/*.parquet.gz
+!data/current/*.jsonl
 .audit/
 .work/
 dist/

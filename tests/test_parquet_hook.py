@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: NOASSERTION
 # Copyright (c) 2026 NordicIntel
-"""Exercise automatic Parquet splitting through a real Git pre-commit hook."""
+"""Exercise Parquet, JSONL and gzip splitting through real Git commits."""
 
+import gzip
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -37,6 +40,7 @@ def repository(tmp_path: Path) -> Path:
     for name in (
         "pyproject.toml",
         "uv.lock",
+        ".gitattributes",
         ".githooks/pre-commit",
         "scripts/parquet_hook.py",
     ):
@@ -72,49 +76,100 @@ def create_data(path: Path) -> list[tuple]:
         return expected
 
 
-def test_commit_splits_rows_without_staging_unrelated_edits(repository: Path) -> None:
-    source = repository / "sample data.parquet"
-    expected = create_data(source)
+@pytest.mark.parametrize("suffix", [".parquet", ".jsonl", ".parquet.gz", ".jsonl.gz"])
+def test_commit_splits_rows_without_staging_unrelated_edits(
+    repository: Path, suffix: str
+) -> None:
+    source = repository / f"sample data{suffix}"
+    if ".jsonl" in suffix:
+        expected_bytes = b"\r\n".join(
+            json.dumps(
+                {
+                    "id": i,
+                    "label": "å",
+                    "value": hashlib.md5(str(i).encode()).hexdigest(),
+                },
+                ensure_ascii=False,
+            ).encode()
+            for i in range(4000)
+        )
+        source.write_bytes(expected_bytes)
+    else:
+        expected = create_data(source)
+    if suffix.endswith(".gz"):
+        source.write_bytes(gzip.compress(source.read_bytes(), mtime=0))
+    assert source.stat().st_size >= 40_000
     untouched = repository / "small.parquet"
     with duckdb.connect() as connection:
         connection.sql("SELECT 1 AS id").write_parquet(str(untouched))
     small_bytes = untouched.read_bytes()
-    git(repository, "add", "sample data.parquet", "small.parquet")
+    git(repository, "add", source.name, "small.parquet")
     (repository / "local.txt").write_text("Do not commit this")
     result = git(repository, "commit", "-m", "Split a dataset")
     assert "parquet-hook:" in result.stderr + result.stdout
     parts = sorted(
-        repository.glob("sample data_part_*.parquet"),
-        key=lambda p: int(p.stem.rsplit("_", 1)[1]),
+        repository.glob(f"sample data_part_*{suffix}"),
+        key=lambda p: int(p.name.rsplit("_", 1)[1].split(".")[0]),
     )
     assert len(parts) >= 2
     assert not source.exists()
     assert all(p.stat().st_size < 40_000 for p in parts)
-    with duckdb.connect() as connection:
-        actual = [
-            row for p in parts for row in connection.read_parquet(str(p)).fetchall()
+    if ".jsonl" in suffix:
+        contents = [
+            gzip.decompress(p.read_bytes())
+            if suffix.endswith(".gz")
+            else p.read_bytes()
+            for p in parts
         ]
-    assert actual == expected
+        assert b"".join(contents) == expected_bytes
+        assert (
+            sum(
+                len([json.loads(line) for line in data.splitlines()])
+                for data in contents
+            )
+            == 4000
+        )
+    else:
+        with duckdb.connect() as connection:
+            actual = []
+            for part in parts:
+                decoded = repository / "decoded.parquet"
+                if suffix.endswith(".gz"):
+                    decoded.write_bytes(gzip.decompress(part.read_bytes()))
+                actual.extend(
+                    connection.read_parquet(
+                        str(decoded if suffix.endswith(".gz") else part)
+                    ).fetchall()
+                )
+                decoded.unlink(missing_ok=True)
+        assert actual == expected
     assert untouched.read_bytes() == small_bytes
     tracked = git(
         repository, "ls-tree", "-r", "--name-only", "HEAD"
     ).stdout.splitlines()
-    assert "sample data.parquet" not in tracked
+    assert source.name not in tracked
     assert all(p.name in tracked for p in parts)
     assert "local.txt" not in tracked
     git(repository, "commit", "--allow-empty", "-qm", "Unchanged files")
-    assert list(repository.glob("*_part_*_part_*.parquet")) == []
+    assert list(repository.glob(f"*_part_*_part_*{suffix}")) == []
 
 
-@pytest.mark.parametrize("problem", ["unstaged", "collision", "malformed"])
+@pytest.mark.parametrize(
+    "problem", ["unstaged", "collision", "malformed", "truncated-gzip"]
+)
 def test_failed_commit_preserves_index_and_files(
     repository: Path, problem: str
 ) -> None:
-    source = repository / "data.parquet"
+    source = repository / (
+        "data.parquet.gz" if problem == "truncated-gzip" else "data.parquet"
+    )
     create_data(source)
     if problem == "malformed":
         source.write_bytes(b"invalid parquet" * 4000)
-    git(repository, "add", "data.parquet")
+    if problem == "truncated-gzip":
+        source.write_bytes(gzip.compress(source.read_bytes())[:-8])
+        assert source.stat().st_size >= 40_000
+    git(repository, "add", source.name)
     if problem == "unstaged":
         source.write_bytes(source.read_bytes() + b"uncommitted")
     if problem == "collision":
