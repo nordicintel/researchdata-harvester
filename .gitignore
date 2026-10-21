@@ -12,3 +12,4 @@ data/current/*
 dist/
 *.egg-info/
 config.local.toml
+/legacy/
