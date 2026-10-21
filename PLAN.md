@@ -54,51 +54,51 @@ The target is exactly two Parquet files, one per table. Numbered parts are an ex
 
 ### Root files
 
-| File | Role |
-|---|---|
-| `README.md` | The operating guide covering setup, commands, inclusion rules, output schemas, maintenance and troubleshooting. Include external API documentation and examples for querying the Parquet tables with DuckDB. |
-| `PLAN.md` | The agreed implementation scope, sequence and acceptance criteria. Update this file when the user changes those decisions. |
-| `pyproject.toml` | Dependency-only Python 3.12+ project configuration, test settings and Ruff settings. Keep `package = false`; add no build configuration or installed CLI. |
-| `uv.lock` | Reproducible dependency versions for local execution and Actions. |
-| `config.toml` | Endpoints, paths, concurrency, timeouts, retry settings and verification limits. Default binary verification cap is 32 MiB. |
-| `.gitignore` | Ignore temporary work, downloads, local configuration, environments and caches. |
-| `.gitattributes` | Treat generated current data as binary to prevent newline conversion from invalidating checksums. |
+| File             | Role                                                                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `README.md`      | The operating guide covering setup, commands, inclusion rules, output schemas, maintenance and troubleshooting. Include external API documentation and examples for querying the Parquet tables with DuckDB. |
+| `PLAN.md`        | The agreed implementation scope, sequence and acceptance criteria. Update this file when the user changes those decisions.                                                                                   |
+| `pyproject.toml` | Dependency-only Python 3.12+ project configuration, test settings and Ruff settings. Keep `package = false`; add no build configuration or installed CLI.                                                    |
+| `uv.lock`        | Reproducible dependency versions for local execution and Actions.                                                                                                                                            |
+| `config.toml`    | Endpoints, paths, concurrency, timeouts, retry settings and verification limits. Default binary verification cap is 32 MiB.                                                                                  |
+| `.gitignore`     | Ignore temporary work, downloads, local configuration, environments and caches.                                                                                                                              |
+| `.gitattributes` | Treat generated current data as binary to prevent newline conversion from invalidating checksums.                                                                                                            |
 
 ### Implementation files
 
-| File | Role |
-|---|---|
-| `harvester/runtime.py` | Load and validate configuration and provide the shared asynchronous HTTP client. Centralize logging setup, concurrency limits, timeouts, retries and `Retry-After` handling. |
-| `harvester/dataportalen.py` | Own the scoped inventory query, change detection and retrieval of complete Dataportalen metadata, including related entities. Reuse and revalidate cached RDF entities; confirm membership and exclusions before removal. |
-| `harvester/researchdata.py` | Resolve current Researchdata identities and retrieve available dataset metadata. Reuse confirmed associations and exact identities without full-catalog OAI enumeration or title-based matching. |
-| `harvester/external.py` | Retrieve metadata and resource descriptions from linked repositories, including existing Zenodo, KTH, ICOS and SITES cases. Share resource lookups and report unavailable outcomes. |
-| `harvester/verify.py` | Inspect bounded samples of candidate data resources using format-specific libraries. Return verification evidence and explicit failure or unresolved outcomes. |
-| `harvester/output.py` | Normalize retrieved metadata into the declared schemas, apply SQL replacements through DuckDB, validate the candidate and write Parquet plus inventory and manifest. Own local atomic replacement and interrupted-replacement recovery. |
-| `harvester/schema.sql` | The authoritative DuckDB table definitions, including typed nested structures for repeated entities, resources and provenance. Avoid parallel schema definitions in Python. |
-| `harvester/vocabulary.json` | Checked-in namespace and predicate-to-column mappings used during normalization. Keep fetched vocabulary definitions and labels in the RDF cache, and preserve unknown source properties rather than discarding them. |
+| File                        | Role                                                                                                                                                                                                                                    |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `harvester/runtime.py`      | Load and validate configuration and provide the shared asynchronous HTTP client. Centralize logging setup, concurrency limits, timeouts, retries and `Retry-After` handling.                                                            |
+| `harvester/dataportalen.py` | Own the scoped inventory query, change detection and retrieval of complete Dataportalen metadata, including related entities. Reuse and revalidate cached RDF entities; confirm membership and exclusions before removal.               |
+| `harvester/researchdata.py` | Resolve current Researchdata identities and retrieve available dataset metadata. Reuse confirmed associations and exact identities without full-catalog OAI enumeration or title-based matching.                                        |
+| `harvester/external.py`     | Retrieve metadata and resource descriptions from linked repositories, including existing Zenodo, KTH, ICOS and SITES cases. Share resource lookups and report unavailable outcomes.                                                     |
+| `harvester/verify.py`       | Inspect bounded samples of candidate data resources using format-specific libraries. Return verification evidence and explicit failure or unresolved outcomes.                                                                          |
+| `harvester/output.py`       | Normalize retrieved metadata into the declared schemas, apply SQL replacements through DuckDB, validate the candidate and write Parquet plus inventory and manifest. Own local atomic replacement and interrupted-replacement recovery. |
+| `harvester/schema.sql`      | The authoritative DuckDB table definitions, including typed nested structures for repeated entities, resources and provenance. Avoid parallel schema definitions in Python.                                                             |
+| `harvester/vocabulary.json` | Checked-in namespace and predicate-to-column mappings used during normalization. Keep fetched vocabulary definitions and labels in the RDF cache, and preserve unknown source properties rather than discarding them.                   |
 
 ### Executable scripts and tests
 
-| File | Role |
-|---|---|
-| `scripts/sync.py` | A thin CLI coordinating inventory, parallel retrieval and output construction. Expose the same stages individually for Actions and collectively for local execution. |
-| `scripts/publish.py` | Validate the candidate, verify the expected Git head and create a generated-data-only commit. Reject publication races and never force-push. |
-| `tests/test_inventory.py` | Test filtering, pagination, timestamp comparison, additions, removals and incomplete inventories. |
-| `tests/test_metadata.py` | Test identity resolution, related entities, description links, metadata fidelity and multiple legitimate associations. Cover RDF cache reuse, revalidation, refresh failures and preservation of RDF terms. |
-| `tests/test_verification.py` | Test actual rows, supported formats, licence acknowledgements, byte limits, misleading responses and access failures. |
-| `tests/test_publication.py` | Test DuckDB schemas, replacements, retained stale records, deterministic output, checksums, recovery and Git publication safeguards. |
+| File                         | Role                                                                                                                                                                                                        |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/sync.py`            | A thin CLI coordinating inventory, parallel retrieval and output construction. Expose the same stages individually for Actions and collectively for local execution.                                        |
+| `scripts/publish.py`         | Validate the candidate, verify the expected Git head and create a generated-data-only commit. Reject publication races and never force-push.                                                                |
+| `tests/test_inventory.py`    | Test filtering, pagination, timestamp comparison, additions, removals and incomplete inventories.                                                                                                           |
+| `tests/test_metadata.py`     | Test identity resolution, related entities, description links, metadata fidelity and multiple legitimate associations. Cover RDF cache reuse, revalidation, refresh failures and preservation of RDF terms. |
+| `tests/test_verification.py` | Test actual rows, supported formats, licence acknowledgements, byte limits, misleading responses and access failures.                                                                                       |
+| `tests/test_publication.py`  | Test DuckDB schemas, replacements, retained stale records, deterministic output, checksums, recovery and Git publication safeguards.                                                                        |
 
 ### Workflows and generated files
 
-| File | Role |
-|---|---|
-| `.github/workflows/harvest.yml` | Run daily at 03:17 UTC or manually, with inventory, two parallel fetch jobs and one dependent build/publication job. |
-| `.github/workflows/validate.yml` | Run offline tests, Ruff, formatting checks and published-data validation for code and proposed data changes. |
-| `data/current/datasets.parquet` | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. Keep this as one file whenever it fits below 100 MB. |
-| `data/current/dataportalen.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. Keep this as one file whenever it fits below 100 MB. |
-| `data/current/inventory.json` | Current source membership, modification indicators, confirmed associations and processing outcomes, including excluded or unresolved candidates. |
-| `data/current/rdf-cache.json.gz` | A URI-keyed JSON cache of fetched vocabulary definitions and shared RDF entities, compressed with gzip. Preserve RDF term types, languages, datatypes, linked nodes, source URLs and available HTTP validators. |
-| `data/current/manifest.json` | Schema version, output filenames, counts and checksums for a consistent published generation. |
+| File                                | Role                                                                                                                                                                                                            |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.github/workflows/harvest.yml`     | Run daily at 03:17 UTC or manually, with inventory, two parallel fetch jobs and one dependent build/publication job.                                                                                            |
+| `.github/workflows/validate.yml`    | Run offline tests, Ruff, formatting checks and published-data validation for code and proposed data changes.                                                                                                    |
+| `data/current/datasets.parquet`     | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. Keep this as one file whenever it fits below 100 MB.                                   |
+| `data/current/dataportalen.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. Keep this as one file whenever it fits below 100 MB.                                                         |
+| `data/current/inventory.json`       | Current source membership, modification indicators, confirmed associations and processing outcomes, including excluded or unresolved candidates.                                                                |
+| `data/current/rdf-cache.json.gz`    | A URI-keyed JSON cache of fetched vocabulary definitions and shared RDF entities, compressed with gzip. Preserve RDF term types, languages, datatypes, linked nodes, source URLs and available HTTP validators. |
+| `data/current/manifest.json`        | Schema version, output filenames, counts and checksums for a consistent published generation.                                                                                                                   |
 
 ## 2. Inventory and retrieval
 
@@ -155,10 +155,10 @@ Use standard-library CSV and JSON support where sufficient, spreadsheet readers 
 
 Use explicit DuckDB schemas with `STRUCT` and list columns for repeated metadata. Read existing Parquet into temporary working tables, apply replacements with SQL, validate and export using `COPY ... FORMAT PARQUET` with Zstandard compression. DuckDB supports direct Parquet reading and writing. [DuckDB Parquet documentation](https://duckdb.org/docs/2.0/data/parquet/overview)
 
-| Table | Primary identity | Main columns |
-|---|---|---|
-| `datasets` | Dataportalen dataset URI | Researchdata identifiers, multilingual titles/descriptions, publishers, subjects, languages, temporal/spatial descriptions, rights, licences, source URLs, resources, verification evidence, availability and additional source properties |
-| `dataportalen` | Dataportalen dataset URI | Registry entry URI, modification values, multilingual descriptive fields, identifiers, publishers, contacts, distributions, services and complete related metadata |
+| Table          | Primary identity         | Main columns                                                                                                                                                                                                                               |
+| -------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `datasets`     | Dataportalen dataset URI | Researchdata identifiers, multilingual titles/descriptions, publishers, subjects, languages, temporal/spatial descriptions, rights, licences, source URLs, resources, verification evidence, availability and additional source properties |
+| `dataportalen` | Dataportalen dataset URI | Registry entry URI, modification values, multilingual descriptive fields, identifiers, publishers, contacts, distributions, services and complete related metadata                                                                         |
 
 - Join both tables on the exact Dataportalen dataset URI.
 - Preserve multiple Researchdata associations as a list.
