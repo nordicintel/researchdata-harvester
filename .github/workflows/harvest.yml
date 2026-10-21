@@ -1,0 +1,44 @@
+name: Harvest
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Refresh all current Researchdata representations
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: current-catalog
+  cancel-in-progress: false
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Remember the checked-out main commit
+        run: echo "HARVEST_HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Harvest current metadata
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          if [ "$FULL" = "true" ]; then
+            uv run python -u -m scripts.sync --full
+          else
+            uv run python -u -m scripts.sync
+          fi
+      - name: Publish the validated current result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          uv run python -m scripts.publish --expected-head "$HARVEST_HEAD"

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: NOASSERTION
 # Copyright (c) 2026 NordicIntel
-"""Lossless XML trees and the six OAI-PMH verbs with complete page iterators."""
+"""Parse OAI-PMH records and traverse current metadata and identifier listings."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 from defusedxml.ElementTree import fromstring
@@ -100,33 +99,6 @@ class OAIClient:
             )
         return container
 
-    async def identify(self) -> dict[str, Any]:
-        element = await self.call("Identify")
-        return xml_tree(element)
-
-    async def list_metadata_formats(
-        self, identifier: str | None = None
-    ) -> list[dict[str, Any]]:
-        element = await self.call("ListMetadataFormats", identifier=identifier)
-        return [xml_tree(item) for item in element.findall(NS + "metadataFormat")]
-
-    async def list_sets(self, *, resumption_token: str | None = None) -> Page:
-        return await self._page("ListSets", resumption_token=resumption_token)
-
-    async def list_identifiers(
-        self, metadata_prefix: str = "datacite", **options: Any
-    ) -> Page:
-        return await self._page(
-            "ListIdentifiers", metadata_prefix=metadata_prefix, **options
-        )
-
-    async def list_records(
-        self, metadata_prefix: str = "datacite", **options: Any
-    ) -> Page:
-        return await self._page(
-            "ListRecords", metadata_prefix=metadata_prefix, **options
-        )
-
     async def get_record(
         self, identifier: str, metadata_prefix: str = "datacite"
     ) -> Record:
@@ -208,41 +180,3 @@ class OAIClient:
                 break
             seen.add(page.token)
             token = page.token
-
-    async def iter_records(
-        self, metadata_prefix: str = "datacite", **options: Any
-    ) -> AsyncIterator[Record]:
-        async for page in self.iter_pages(
-            "ListRecords", metadata_prefix=metadata_prefix, **options
-        ):
-            for record in page.items:
-                yield record
-
-    async def iter_identifiers(
-        self, metadata_prefix: str = "datacite", **options: Any
-    ) -> AsyncIterator[dict[str, Any]]:
-        async for page in self.iter_pages(
-            "ListIdentifiers", metadata_prefix=metadata_prefix, **options
-        ):
-            for header in page.items:
-                yield header
-
-    async def iter_sets(self) -> AsyncIterator[dict[str, Any]]:
-        async for page in self.iter_pages("ListSets"):
-            for item in page.items:
-                yield item
-
-
-def build_file_url(dataset_id: str, version: str | int, filename: str = "") -> str:
-    """Construct an unverified API URL; callers must obtain filenames from metadata."""
-    parts = [dataset_id, str(version), *filename.replace("\\", "/").split("/")]
-    if any(
-        part in {"", ".", ".."} or "/" in part or "\\" in part for part in parts[:2]
-    ):
-        raise ValueError("Dataset ID and version must be individual path components.")
-    if any(part in {".", ".."} for part in parts[2:]):
-        raise ValueError("File paths cannot contain traversal components.")
-    base = f"https://api.researchdata.se/dataset/{quote(parts[0], safe='')}/{quote(parts[1], safe='')}/file"
-    return base + (
-        "/" + "/".join(quote(part, safe="") for part in parts[2:]) if filename else ""
-    )

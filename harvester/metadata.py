@@ -90,7 +90,31 @@ def scalar_values(value: Any) -> Iterator[str]:
                     yield item[key]
 
 
-def extract_evidence(tree: dict[str, Any] | None) -> list[dict[str, str]]:
+def owned_datasets(document: Any, anchors: set[str]) -> list[dict[str, Any]]:
+    entities = [
+        entity
+        for entity in json_entities(document)
+        if not entity.get("@type") or "Dataset" in str(entity["@type"])
+    ]
+    if len(entities) > 1:
+        entities = [
+            entity
+            for entity in entities
+            if anchors
+            & {
+                normalize_identity(value)
+                for field in ("identifier", "@id")
+                for value in scalar_values(entity.get(field, []))
+            }
+        ]
+        if len(entities) != 1:
+            return []
+    return entities
+
+
+def extract_evidence(
+    tree: dict[str, Any] | None, *, primary_identifiers: set[str] | None = None
+) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     if tree is None:
         return result
@@ -156,11 +180,7 @@ def extract_evidence(tree: dict[str, Any] | None) -> list[dict[str, str]]:
                         {"value": value, "field": "/".join(path), "relation": "version"}
                     )
     for document in jsonld_documents(tree):
-        for entity in json_entities(document):
-            if entity.get("@type") and not any(
-                "Dataset" in str(kind) for kind in values(entity["@type"])
-            ):
-                continue
+        for entity in owned_datasets(document, primary_identifiers or set()):
             for key in IDENTITY_NAMES:
                 for value in scalar_values(entity.get(key, [])):
                     result.append(
@@ -252,6 +272,8 @@ class JSONLDParser(HTMLParser):
 
 def metadata_summary(
     trees: list[dict[str, Any] | None],
+    *,
+    primary_identifiers: set[str] | None = None,
 ) -> dict[str, list[dict[str, str | None]]]:
     """Return source titles, descriptions and publishers without discarding languages."""
     result: dict[str, list[dict[str, str | None]]] = {
@@ -290,11 +312,7 @@ def metadata_summary(
                     ),
                 )
         for document in jsonld_documents(tree):
-            for entity in json_entities(document):
-                if entity.get("@type") and not any(
-                    "Dataset" in str(kind) for kind in values(entity["@type"])
-                ):
-                    continue
+            for entity in owned_datasets(document, primary_identifiers or set()):
                 for key, target in (
                     ("name", "titles"),
                     ("description", "descriptions"),

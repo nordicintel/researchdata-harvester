@@ -307,7 +307,7 @@ wheels = [
 [[package]]
 name = "researchdata-harvester"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "defusedxml" },
     { name = "httpx" },

@@ -49,7 +49,8 @@ Target repository: `nordicintel/researchdata-harvester`, public. The public-repo
 - Publish one current output set. Do not add dated snapshot directories, historical release archives or application-managed version retention.
 - Public Git history is distinct from a versioning feature in the harvester; do not add custom historical-data functionality on top of it.
 - The user's hosting premise is that public-repository Actions provide the needed execution minutes. Verify the applicable runner, storage and file-size limits when implementing the workflow; do not treat this document as a verified statement of unlimited usage for every GitHub service.
-- Choose the exact schedule and publication mechanism during workflow implementation. They have not yet been specified.
+- Publish current data and incremental state on `main` in one commit, daily at 03:17 UTC and through manual workflow execution.
+- Use JSON/JSONL files as both the published output and persisted current state. SQLite is used only for the one-time migration.
 
 ### 5. Minimal persistent matching map
 
@@ -128,4 +129,6 @@ Target repository: `nordicintel/researchdata-harvester`, public. The public-repo
 
 ## Implementation status
 
-This document is the agreed direction, not a completion report. The moved package still contains functionality slated for removal. GitHub repository creation and scheduled workflow setup have not yet been performed in this conversation.
+The new implementation lives in `harvester/`, with executable commands in `scripts/` and workflows in `.github/`. It runs directly through `uv run python -m scripts.sync`; it is not built or installed as a library. The existing `src/researchdata_harvester` remains unchanged as reference and is not imported by the new code.
+
+Current JSON files live in `data/current/`. The local migration retains and verifies downloaded files separately. Completion of migration, live acceptance and GitHub workflow execution must be established by their actual results, not inferred from the presence of code.

@@ -2,5 +2,12 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-data/
+data/*
+!data/current/
+data/current/*
+!data/current/*.json
+!data/current/*.jsonl.gz
+.audit/
+.work/
+dist/
 *.egg-info/

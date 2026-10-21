@@ -17,7 +17,9 @@ class FakeTransport:
         )
         self.calls = []
 
-    async def request(self, method, url, *, allowed_statuses, **kwargs):
+    async def request(
+        self, method, url, *, allowed_statuses, metadata_only=False, **kwargs
+    ):
         self.calls.append((url, kwargs))
         response = await self.client.request(method, url, **kwargs)
         if response.status_code not in allowed_statuses:
@@ -59,6 +61,93 @@ async def test_api_metadata_is_complete_and_shared_url_is_fetched_once():
     assert external[0]["identifiers"] == ["dataset", "other"]
     assert len(files) == 2
     assert files[0]["metadata"]["checksum"] == "md5:abc"
+
+
+@pytest.mark.parametrize("format", ["json", "rdf"])
+async def test_external_graph_files_belong_only_to_current_dataset(format):
+    current = "https://example.org/current"
+    if format == "json":
+        response = httpx.Response(
+            200,
+            json={
+                "@graph": [
+                    {
+                        "@id": current,
+                        "@type": "Dataset",
+                        "distribution": {"@id": "_:file"},
+                    },
+                    {
+                        "@id": "_:file",
+                        "@type": "DataDownload",
+                        "contentUrl": "https://example.org/current.csv",
+                    },
+                    {
+                        "@id": "https://example.org/old",
+                        "@type": "Dataset",
+                        "distribution": {"contentUrl": "https://example.org/old.csv"},
+                    },
+                ]
+            },
+        )
+    else:
+        response = httpx.Response(
+            200,
+            text="""@prefix dcat: <http://www.w3.org/ns/dcat#> .
+<https://example.org/current> dcat:distribution [dcat:downloadURL <https://example.org/current.csv>];
+<https://schema.org/citation> <https://example.org/old> .
+<https://example.org/old> dcat:distribution [dcat:downloadURL <https://example.org/old.csv>] .""",
+            headers={"content-type": "text/turtle"},
+        )
+    external, files = await enrich_records(
+        FakeTransport(lambda request: response), research(current), {}, [], []
+    )
+    assert [entry["url"] for entry in files] == ["https://example.org/current.csv"]
+    assert "old.csv" in str(external[0]["metadata"])
+
+
+async def test_restricted_repository_api_uses_landing_metadata_fallback():
+    def handler(request):
+        if "/api/" in request.url.path:
+            return httpx.Response(403)
+        return httpx.Response(
+            200,
+            text='<script type="application/ld+json">{"@type":"Dataset","distribution":{"contentUrl":"https://example.org/data.csv"}}</script>',
+            headers={"content-type": "text/html"},
+        )
+
+    transport = FakeTransport(handler)
+    external, files = await enrich_records(
+        transport, research("10.5281/zenodo.1"), {}, [], []
+    )
+    assert len(transport.calls) == 2
+    assert {entry["status"] for entry in external} == {"restricted", "available"}
+    assert [entry["url"] for entry in files] == ["https://example.org/data.csv"]
+
+
+async def test_ambiguous_links_do_not_attribute_dataportalen_files():
+    dataportalen = {
+        "urn:d": {
+            "uri": "urn:d",
+            "metadata": {
+                "root": "urn:d",
+                "nodes": {
+                    "urn:d": {
+                        "http://www.w3.org/ns/dcat#downloadURL": [
+                            {"type": "uri", "value": "https://example.org/data.csv"}
+                        ]
+                    }
+                },
+            },
+        }
+    }
+    _, files = await enrich_records(
+        FakeTransport(lambda request: pytest.fail("Unexpected request")),
+        {"r": {"representations": {}}},
+        dataportalen,
+        [{"identifier": "r", "uri": "urn:d", "status": "ambiguous"}],
+        [],
+    )
+    assert files == []
 
 
 async def test_conditional_304_reuses_metadata_without_mutating_previous():
@@ -219,7 +308,9 @@ async def test_dataportalen_distributions_and_research_files_both_survive():
                 "root": "urn:d",
                 "nodes": {
                     "urn:d": {
-                        "http://www.w3.org/ns/dcat#distribution": [{"value": "_:dist"}]
+                        "http://www.w3.org/ns/dcat#distribution": [
+                            {"type": "bnode", "value": "dist"}
+                        ]
                     },
                     "_:dist": {
                         "http://www.w3.org/ns/dcat#downloadURL": [
@@ -275,9 +366,9 @@ async def test_linked_alternate_rdf_is_retrieved_without_crawling_its_relationsh
     assert len(first) == 2
     assert first == second
     assert len(transport.calls) == 4
-    assert first[1]["metadata"][0]["https://schema.org/name"] == [
-        {"@language": "en", "@value": "Name"}
-    ]
+    assert first[1]["metadata"]["nodes"]["https://example.org/dataset/1"][
+        "https://schema.org/name"
+    ] == [{"xml:lang": "en", "type": "literal", "value": "Name"}]
 
 
 async def test_researchdata_owned_pages_and_restricted_data_files_are_not_fetched():
@@ -302,3 +393,119 @@ async def test_304_without_previous_successful_metadata_is_an_error():
             [],
             [],
         )
+
+
+async def test_rdf_literals_and_multiple_download_links_survive():
+    content = """@prefix dcat: <http://www.w3.org/ns/dcat#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<https://example.org/dataset/1> dcat:downloadURL <https://example.org/a.csv>, <https://example.org/b.csv>;
+<https://example.org/code> "001"^^xsd:integer ."""
+    transport = FakeTransport(
+        lambda request: httpx.Response(
+            200, text=content, headers={"content-type": "text/turtle"}
+        )
+    )
+    external, files = await enrich_records(
+        transport, research("https://example.org/dataset/1"), {}, [], []
+    )
+    terms = external[0]["metadata"]["nodes"]["https://example.org/dataset/1"]
+    assert terms["https://example.org/code"] == [
+        {
+            "type": "literal",
+            "value": "001",
+            "datatype": "http://www.w3.org/2001/XMLSchema#integer",
+        }
+    ]
+    assert {entry["url"] for entry in files} == {
+        "https://example.org/a.csv",
+        "https://example.org/b.csv",
+    }
+
+
+async def test_xml_dcat_distributions_are_processed():
+    from defusedxml.ElementTree import fromstring
+
+    from harvester.oai import xml_tree
+
+    tree = xml_tree(
+        fromstring("""<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dcat="http://www.w3.org/ns/dcat#">
+<dcat:Dataset><dcat:distribution><dcat:Distribution><dcat:downloadURL rdf:resource="https://example.org/data.csv"/><dcat:accessURL rdf:resource="https://example.org/metadata"/></dcat:Distribution></dcat:distribution></dcat:Dataset></rdf:RDF>""")
+    )
+    transport = FakeTransport(
+        lambda request: httpx.Response(200, json={"name": "More metadata"})
+    )
+    external, files = await enrich_records(
+        transport, {"r": {"representations": {"dcat": tree}}}, {}, [], []
+    )
+    assert [record["url"] for record in external] == ["https://example.org/metadata"]
+    assert [record["url"] for record in files] == ["https://example.org/data.csv"]
+
+
+async def test_jsonld_graph_uses_datacite_owner_for_files_and_metadata_resources():
+    distribution = {
+        "@type": "DataDownload",
+        "contentUrl": "https://files.test/owner.csv",
+        "encodingFormat": ["text/csv", "application/csv"],
+        "description": [{"@value": "Data", "@language": "en"}],
+    }
+    graph = {
+        "@graph": [
+            {
+                "@type": "Dataset",
+                "identifier": "10.5878/cited",
+                "url": "https://metadata.test/cited",
+                "distribution": {"contentUrl": "https://files.test/cited.csv"},
+            },
+            {
+                "@type": "Dataset",
+                "identifier": {"value": "https://doi.org/10.5878/OWNER"},
+                "url": "https://metadata.test/owner",
+                "distribution": distribution,
+                "citation": {"@id": "https://metadata.test/cited"},
+            },
+        ]
+    }
+    before = copy.deepcopy(graph)
+    records = research("10.5878/owner")
+    records["dataset"]["identities"][0]["format"] = "datacite"
+    records["dataset"]["representations"] = {"json_ld": graph}
+
+    def handler(request):
+        assert str(request.url) == "https://metadata.test/owner"
+        return httpx.Response(200, json={"name": ["Metadata", "Metadata"]})
+
+    transport = FakeTransport(handler)
+    external, files = await enrich_records(transport, records, {}, [], [])
+    assert [item["url"] for item in external] == ["https://metadata.test/owner"]
+    assert external[0]["metadata"] == {"name": ["Metadata", "Metadata"]}
+    assert [item["url"] for item in files] == [distribution["contentUrl"]]
+    assert files[0]["metadata"]["raw"] == distribution
+    assert len(transport.calls) == 1
+    assert graph == before
+
+
+@pytest.mark.parametrize("graph_identifier", ["10.5878/related", "10.5878/owner"])
+async def test_ambiguous_jsonld_graph_does_not_assign_files_or_resources(
+    graph_identifier: str,
+):
+    records = research("10.5878/owner")
+    records["dataset"]["identities"][0]["format"] = "datacite"
+    records["dataset"]["representations"] = {
+        "json_ld": {
+            "@graph": [
+                {
+                    "@type": "Dataset",
+                    "identifier": identifier,
+                    "url": f"https://metadata.test/{index}",
+                    "distribution": {"contentUrl": f"https://files.test/{index}.csv"},
+                }
+                for index, identifier in enumerate([graph_identifier] * 2)
+            ]
+        }
+    }
+    transport = FakeTransport(
+        lambda request: pytest.fail("Unexpected metadata request")
+    )
+    external, files = await enrich_records(transport, records, {}, [], [])
+    assert external == []
+    assert files == []

@@ -265,7 +265,7 @@ class DataportalenClient:
             for _, obj in outgoing
         )
         if invalid_count:
-            logger.warning(
+            logger.debug(
                 "Dataportalen metadata contains %d ill-typed literal triples; "
                 "original lexical values and datatypes are preserved with ill_typed=true.",
                 invalid_count,
@@ -460,6 +460,10 @@ async def harvest_dataportalen(
     catalog = await client.catalog_inventory(
         config.catalog_metadata_url, config.catalog_uri
     )
+    if previous and not catalog["members"]:
+        raise ValueError(
+            "Dataportalen catalog is unexpectedly empty; refusing to infer removals."
+        )
     records: dict[str, dict[str, Any]] = {}
     batch_size = config.identity_batch_size
     if batch_size < 1:
@@ -477,4 +481,10 @@ async def harvest_dataportalen(
                 "identities": [evidence[key] for key in sorted(evidence)],
                 "metadata": metadata[uri],
             }
+        if offset == 0 or len(records) % 1000 == 0:
+            logger.info(
+                "Dataportalen metadata: %d/%d records",
+                len(records),
+                len(catalog["members"]),
+            )
     return records, catalog

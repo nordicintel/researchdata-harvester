@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Iterator
 from html.parser import HTMLParser
@@ -13,8 +14,19 @@ from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
-from rdflib import Graph
-from rdflib.compare import to_canonical_graph
+import rdflib
+from defusedxml.ElementTree import fromstring
+from rdflib import BNode, Graph, Literal
+
+from harvester.dataportalen import triples_to_metadata
+from harvester.metadata import (
+    json_entities,
+    jsonld_documents,
+    normalize_identity,
+    owned_datasets,
+    walk_xml,
+)
+from harvester.oai import xml_tree
 
 PERMANENT = {401, 403, 404, 410}
 OWN_HOSTS = {"researchdata.se", "www.researchdata.se", "api.researchdata.se"}
@@ -31,6 +43,9 @@ SKIP_FIELDS = {
     "previousversion",
     "parent",
     "history",
+    "isbasedon",
+    "isversionof",
+    "hasversion",
 }
 
 
@@ -74,7 +89,6 @@ def _external(value: str) -> bool:
         return False
     if parsed.hostname in OWN_HOSTS:
         return False
-    # These source-owned DOI pages repeat the three harvested representations.
     return not (
         parsed.hostname in {"doi.org", "dx.doi.org"}
         and re.match(r"/10\.(5878|5879)/", parsed.path)
@@ -118,42 +132,102 @@ class _LandingParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script" and self.buffer is not None:
-            self.documents.append(json.loads("".join(self.buffer)))
+            self.documents.append(json.loads("".join(self.buffer), strict=False))
             self.buffer = None
 
 
-def _documents(value: Any) -> Iterator[dict[str, Any]]:
+def _documents(value: Any, anchors: set[str] | None = None) -> Iterator[dict[str, Any]]:
     if isinstance(value, dict):
+        if "@graph" in value:
+            nodes = {
+                entity["@id"]: entity
+                for entity in json_entities(value)
+                if "@id" in entity
+            }
+            pending = list(owned_datasets(value, anchors or set()))
+            seen = set()
+            while pending:
+                entity = pending.pop()
+                if id(entity) in seen:
+                    continue
+                seen.add(id(entity))
+                for child in _documents(entity, anchors):
+                    yield child
+                    target = nodes.get(child.get("@id"))
+                    if target is not None and "Dataset" not in str(
+                        target.get("@type", "")
+                    ):
+                        pending.append(target)
+            return
+        if "nodes" in value and "root" in value:
+            nodes = value["nodes"]
+            pending = [
+                key for key in nodes if normalize_identity(key) in (anchors or set())
+            ]
+            if not pending and value["root"] in nodes:
+                pending = [value["root"]]
+            seen = set()
+            while pending:
+                subject = pending.pop()
+                if subject in seen:
+                    continue
+                seen.add(subject)
+                entity = nodes[subject]
+                yield entity
+                for predicate, terms in entity.items():
+                    if _local(predicate).casefold() not in {"distribution", "checksum"}:
+                        continue
+                    for term in terms:
+                        target = term.get("value")
+                        if term.get("type") == "bnode":
+                            target = "_:" + target.removeprefix("_:")
+                        if target in nodes:
+                            pending.append(target)
+            return
         yield value
         for key, child in value.items():
-            if key.casefold() in SKIP_FIELDS:
+            if _local(key).casefold() in SKIP_FIELDS:
                 continue
             if (
                 key == "text"
                 and isinstance(child, str)
                 and _local(str(value.get("tag", ""))) == "jsonLdString"
             ):
-                yield from _documents(json.loads(child))
+                yield from _documents(json.loads(child), anchors)
             else:
-                yield from _documents(child)
+                yield from _documents(child, anchors)
     elif isinstance(value, list):
         for child in value:
-            yield from _documents(child)
+            yield from _documents(child, anchors)
 
 
-def _file_metadata(document: Any) -> list[dict]:
+def _file_metadata(document: Any, anchors: set[str] | None = None) -> list[dict]:
     files: dict[str, dict] = {}
-    for node in _documents(document):
-        url = _url(node.get("contentUrl", node.get("downloadURL")))
-        if url:
+    for node in _documents(document, anchors):
+        normalized = {_local(key): value for key, value in node.items()}
+        for key, value in list(normalized.items()):
+            if isinstance(value, list) and len(value) == 1:
+                value = value[0]
+            if isinstance(value, dict) and (
+                "@value" in value
+                or "@id" in value
+                or value.get("type") in {"literal", "uri"}
+            ):
+                value = value.get("@value", value.get("@id", value.get("value")))
+            normalized[key] = value
+        candidates = normalized.get("contentUrl", normalized.get("downloadURL", []))
+        for candidate in candidates if isinstance(candidates, list) else [candidates]:
+            url = _url(candidate)
+            if not url:
+                continue
             files[url] = {
                 "url": url,
-                "name": node.get("name"),
-                "size": node.get("contentSize", node.get("byteSize")),
-                "sha256": node.get("sha256"),
-                "encoding_format": node.get("encodingFormat"),
-                "license": node.get("license"),
-                "access_conditions": node.get("conditionsOfAccess"),
+                "name": normalized.get("name"),
+                "size": normalized.get("contentSize", normalized.get("byteSize")),
+                "sha256": normalized.get("sha256"),
+                "encoding_format": normalized.get("encodingFormat"),
+                "license": normalized.get("license"),
+                "access_conditions": normalized.get("conditionsOfAccess"),
                 "raw": node,
             }
         repository_files = node.get("files")
@@ -196,7 +270,7 @@ def _research_resources(record: dict) -> set[str]:
             continue
         if url := _url(evidence.get("value")):
             urls.add(url)
-    for node in _documents(record.get("representations", {})):
+    for node in _documents(_research_documents(record)):
         kind = node.get("@type", "")
         if "Dataset" in str(kind):
             for field in ("url", "sameAs", "mainEntityOfPage"):
@@ -210,7 +284,41 @@ def _research_resources(record: dict) -> set[str]:
             for field in ("accessURL", "accessUrl"):
                 if url := _url(node.get(field)):
                     urls.add(url)
+    for tree in record.get("representations", {}).values():
+        if not isinstance(tree, dict) or "tag" not in tree:
+            continue
+        for path, node in walk_xml(tree):
+            if path[-1] not in {"accessURL", "landingPage"} or any(
+                part.casefold() in SKIP_FIELDS for part in path
+            ):
+                continue
+            value = next(
+                (
+                    value
+                    for key, value in node.get("attributes", {}).items()
+                    if _local(key) == "resource"
+                ),
+                node.get("text"),
+            )
+            if url := _url(value):
+                urls.add(url)
     return {_resource_url(url) for url in urls if _external(url)}
+
+
+def _research_documents(record: dict) -> list[dict]:
+    anchors = {
+        item.get("normalized") or normalize_identity(item["value"])
+        for item in record.get("identities", [])
+        if item.get("format") == "datacite" and item.get("relation") == "version"
+    }
+    result = []
+    for tree in record.get("representations", {}).values():
+        if not isinstance(tree, dict):
+            continue
+        documents = jsonld_documents(tree) if "tag" in tree else [tree]
+        for document in documents:
+            result.extend(owned_datasets(document, anchors))
+    return result
 
 
 def _dataportalen_resources(record: dict) -> tuple[set[str], list[dict]]:
@@ -220,7 +328,12 @@ def _dataportalen_resources(record: dict) -> tuple[set[str], list[dict]]:
     owned = {root}
     for predicate, terms in nodes.get(root, {}).items():
         if _local(predicate) == "distribution":
-            owned.update(term["value"] for term in terms)
+            owned.update(
+                "_:" + term["value"].removeprefix("_:")
+                if term.get("type") == "bnode"
+                else term["value"]
+                for term in terms
+            )
     for subject in owned:
         for predicate, terms in nodes.get(subject, {}).items():
             field = _local(predicate)
@@ -237,16 +350,43 @@ def _parse_response(response: httpx.Response) -> tuple[Any, list[str]]:
     content_type = response.headers.get("content-type", "").split(";", 1)[0]
     if "json" in content_type:
         return response.json(), []
+    if content_type in {"application/xml", "text/xml"}:
+        return xml_tree(fromstring(response.content)), []
     if content_type in {"application/rdf+xml", "text/turtle", "application/n-triples"}:
-        graph = Graph().parse(
-            data=response.text,
-            format={
-                "application/rdf+xml": "xml",
-                "text/turtle": "turtle",
-                "application/n-triples": "nt",
-            }[content_type],
-        )
-        return json.loads(to_canonical_graph(graph).serialize(format="json-ld")), []
+        previous_normalization = rdflib.NORMALIZE_LITERALS
+        try:
+            rdflib.NORMALIZE_LITERALS = False
+            graph = Graph().parse(
+                data=response.text,
+                publicID=str(response.url),
+                format={
+                    "application/rdf+xml": "xml",
+                    "text/turtle": "turtle",
+                    "application/n-triples": "nt",
+                }[content_type],
+            )
+        finally:
+            rdflib.NORMALIZE_LITERALS = previous_normalization
+
+        def term(value: Any) -> dict:
+            if isinstance(value, BNode):
+                return {"type": "bnode", "value": str(value)}
+            if isinstance(value, Literal):
+                result = {"type": "literal", "value": str(value)}
+                if value.language:
+                    result["xml:lang"] = value.language
+                if value.datatype:
+                    result["datatype"] = str(value.datatype)
+                if value.ill_typed:
+                    result["ill_typed"] = True
+                return result
+            return {"type": "uri", "value": str(value)}
+
+        triples = [
+            {"s": term(subject), "p": term(predicate), "o": term(obj)}
+            for subject, predicate, obj in graph
+        ]
+        return triples_to_metadata(triples, str(response.url)), []
     parser = _LandingParser()
     parser.feed(response.text)
     return {"json_ld": parser.documents, "meta": parser.meta}, [
@@ -273,18 +413,42 @@ async def enrich_records(
 
     def add_files(identifier: str, entries: list[dict]) -> None:
         for entry in entries:
+            old_metadata = files.get((identifier, entry["url"]), {}).get("metadata", {})
             files[(identifier, entry["url"])] = {
                 "identifier": identifier,
                 "url": entry["url"],
-                "metadata": copy.deepcopy(entry),
+                "metadata": copy.deepcopy(
+                    old_metadata
+                    | {key: value for key, value in entry.items() if value is not None}
+                ),
                 "status": "discovered",
             }
 
     for identifier, record in research.items():
-        add_files(identifier, _file_metadata(record.get("representations", {})))
+        add_files(identifier, _file_metadata(_research_documents(record)))
+        for tree in record.get("representations", {}).values():
+            if not isinstance(tree, dict) or "tag" not in tree:
+                continue
+            for path, node in walk_xml(tree):
+                if path[-1] != "downloadURL" or any(
+                    part.casefold() in SKIP_FIELDS for part in path
+                ):
+                    continue
+                value = next(
+                    (
+                        value
+                        for key, value in node.get("attributes", {}).items()
+                        if _local(key) == "resource"
+                    ),
+                    node.get("text"),
+                )
+                if url := _url(value):
+                    add_files(identifier, [{"url": url, "raw": node}])
         for url in _research_resources(record):
             owners.setdefault(url, set()).add(identifier)
     for link in links:
+        if link.get("status") == "ambiguous":
+            continue
         identifier = link.get("identifier")
         if identifier not in research or link.get("uri") not in dataportalen:
             continue
@@ -301,9 +465,18 @@ async def enrich_records(
             headers["If-None-Match"] = validators["etag"]
         if validators.get("last_modified"):
             headers["If-Modified-Since"] = validators["last_modified"]
-        response = await transport.request(
-            "GET", url, headers=headers, allowed_statuses={304, *PERMANENT}
-        )
+        try:
+            response = await transport.request(
+                "GET",
+                url,
+                headers=headers,
+                allowed_statuses={304, *PERMANENT},
+                metadata_only=True,
+            )
+        except httpx.TransportError as error:
+            raise RuntimeError(
+                f"External metadata request failed for {url}: {error}"
+            ) from error
         if response.status_code == 304:
             if not old or old.get("status") != "available":
                 raise ValueError(
@@ -311,6 +484,13 @@ async def enrich_records(
                 )
             return copy.deepcopy(old), list(old.get("related_metadata", []))
         if response.status_code in PERMANENT:
+            parsed = urlsplit(url)
+            fallback = []
+            if parsed.hostname in {
+                "zenodo.org",
+                "datarepository.kth.se",
+            } and re.fullmatch(r"/api/records/[\w-]+", parsed.path):
+                fallback = [url.replace("/api/records/", "/records/", 1)]
             return {
                 "url": url,
                 "final_url": str(response.url),
@@ -320,8 +500,21 @@ async def enrich_records(
                 "http_status": response.status_code,
                 "metadata": None,
                 "validators": {},
-            }, []
+                "related_metadata": fallback,
+            }, fallback
         response.raise_for_status()
+        if response.extensions.get("metadata_body_skipped"):
+            return {
+                "url": url,
+                "final_url": str(response.url),
+                "status": "unsupported",
+                "metadata": {
+                    "content_type": response.headers.get("content-type"),
+                    "content_length": response.headers.get("content-length"),
+                },
+                "validators": {},
+                "metadata_status": "not_a_metadata_response",
+            }, []
         if urlsplit(str(response.url)).hostname in OWN_HOSTS:
             return {
                 "url": url,
@@ -333,7 +526,12 @@ async def enrich_records(
         digest = hashlib.sha256(response.content).hexdigest()
         if old.get("sha256") == digest and old.get("status") == "available":
             return copy.deepcopy(old), list(old.get("related_metadata", []))
-        metadata, related = _parse_response(response)
+        try:
+            metadata, related = _parse_response(response)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid metadata from {response.url}: {error}"
+            ) from error
         endpoint = _resource_url(str(response.url))
         if endpoint != str(response.url):
             related.append(endpoint)
@@ -366,11 +564,24 @@ async def enrich_records(
 
     external: dict[str, dict] = {}
     pending = set(owners)
+    completed = 0
+
+    async def retrieve(url: str) -> tuple[dict, list[str]]:
+        nonlocal completed
+        result = await fetch(url)
+        completed += 1
+        if completed == 1 or completed % 100 == 0:
+            logging.getLogger(__name__).info(
+                "External metadata: %d/%d resources", completed, len(tasks)
+            )
+        return result
+
     while pending:
         batch = sorted(pending)
         pending = set()
         for url in batch:
-            tasks.setdefault(url, asyncio.create_task(fetch(url)))
+            if url not in tasks:
+                tasks[url] = asyncio.create_task(retrieve(url))
         for url, result in zip(
             batch, await asyncio.gather(*(tasks[url] for url in batch)), strict=True
         ):
@@ -380,7 +591,6 @@ async def enrich_records(
                 owners.setdefault(target, set()).update(owners[url])
                 if target not in external and target not in batch:
                     pending.add(target)
-    # Propagate ownership across shared resources after all dependencies resolve.
     changed = True
     while changed:
         changed = False
@@ -393,7 +603,15 @@ async def enrich_records(
         entry["identifiers"] = sorted(owners[url])
         if entry["status"] == "available":
             for identifier in entry["identifiers"]:
-                add_files(identifier, _file_metadata(entry["metadata"]))
+                anchors = {
+                    normalize_identity(value)
+                    for value in (url, entry.get("final_url", url))
+                } | {
+                    item["normalized"]
+                    for item in research[identifier].get("identities", [])
+                    if item.get("relation") == "version" and item.get("normalized")
+                }
+                add_files(identifier, _file_metadata(entry["metadata"], anchors))
     return [external[url] for url in sorted(external)], [
         files[key] for key in sorted(files)
     ]

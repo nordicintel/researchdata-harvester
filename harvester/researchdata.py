@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -53,8 +54,13 @@ def make_record(
                 ):
                     node["json"] = json.loads(node["text"])
     identities = []
+    anchors = {
+        item["normalized"]
+        for item in extract_evidence(trees.get("datacite"))
+        if item.get("relation") == "version"
+    }
     for prefix, tree in trees.items():
-        for item in extract_evidence(tree):
+        for item in extract_evidence(tree, primary_identifiers=anchors):
             evidence = dict(item, format=prefix)
             if evidence not in identities:
                 identities.append(evidence)
@@ -64,8 +70,17 @@ def make_record(
         "datestamp": datestamp,
         "sets": sorted(set(sets)),
         "representations": trees,
+        "source_outcomes": [
+            {
+                "format": prefix,
+                "status": "unavailable",
+                "code": "cannotDisseminateFormat",
+            }
+            for prefix, tree in trees.items()
+            if tree is None
+        ],
         "identities": identities,
-        "summary": metadata_summary(list(trees.values())),
+        "summary": metadata_summary(list(trees.values()), primary_identifiers=anchors),
     }
 
 
@@ -77,6 +92,13 @@ async def _collect(oai: OAIClient, verb: str, **options: Any) -> list[Any]:
         try:
             async for page in oai.iter_pages(verb, **options):
                 items.extend(page.items)
+                if len(items) == len(page.items) or len(items) % 1000 == 0:
+                    logging.getLogger(__name__).info(
+                        "%s %s: %d records",
+                        verb,
+                        options.get("metadata_prefix"),
+                        len(items),
+                    )
                 if page.total is not None:
                     if expected is not None and expected != page.total:
                         raise ValueError(
@@ -261,6 +283,7 @@ async def harvest_researchdata(
             "Current OAI inventory is unexpectedly empty; refusing to infer removals."
         )
     records = {}
+    stream_counts = {prefix: len(rows) for prefix, rows in streams.items()}
     unavailable = []
     reused = 0
     fetched = 0
@@ -275,14 +298,14 @@ async def harvest_researchdata(
             previous[identifier].get("representations", {}).get(prefix) is not None
             for prefix in FORMATS
         ):
-            records[identifier] = deepcopy(previous[identifier])
+            records[identifier] = previous[identifier]
             reused += 1
             continue
         representations = {}
         dates = [stamp]
         record_sets = set(sets)
         for prefix in FORMATS:
-            record = streams[prefix].get(identifier)
+            record = streams[prefix].pop(identifier, None)
             if record is None:
                 try:
                     record = await oai.get_record(identifier, prefix)
@@ -315,7 +338,7 @@ async def harvest_researchdata(
         "reused": reused,
         "get_records": fetched,
         "removed": sorted(set(previous) - set(records)),
-        "streams": {prefix: len(rows) for prefix, rows in streams.items()},
+        "streams": stream_counts,
         "sitemap": sitemap_counts,
         "missing_from_oai": missing,
         "recovered": recovered,

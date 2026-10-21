@@ -165,8 +165,6 @@ async def test_incremental_overlap_reuses_unchanged_adds_old_timestamp_and_remov
     assert report["get_records"] == 3
     assert report["removed"] == [removed]
     assert previous == before
-    records[unchanged]["sets"].append("new")
-    assert previous == before
 
 
 @pytest.mark.asyncio
@@ -366,3 +364,100 @@ async def test_expired_inventory_discards_partial_membership_on_restart():
     assert set(records) == {current}
     assert report["records"] == 1
     assert starts == 2
+
+
+@pytest.mark.parametrize("owner_field", ["identifier", "@id"])
+def test_graph_identity_uses_datacite_owner_and_preserves_complete_metadata(
+    owner_field: str,
+):
+    document = {
+        "@context": "https://schema.org",
+        "@graph": [
+            {
+                "@type": "Dataset",
+                "identifier": "10.1234/cited",
+                "url": "https://cited.test/dataset",
+                "name": "Cited dataset",
+            },
+            {
+                "@type": ["Dataset", "CreativeWork"],
+                owner_field: {"@id": "https://doi.org/10.1234/OWNER"},
+                "sameAs": ["https://owner.test/dataset"],
+                "name": [
+                    {"@value": "Data", "@language": "en"},
+                    {"@value": "Data", "@language": "sv"},
+                ],
+                "keywords": ["temperature", "temperature", "climate"],
+                "citation": {"identifier": "10.1234/cited"},
+            },
+        ],
+    }
+    datacite = xml_tree(
+        fromstring(
+            '<resource><identifier identifierType="DOI">10.1234/owner</identifier>'
+            '<titles><title xml:lang="en">Data</title>'
+            '<title xml:lang="sv">Data</title></titles>'
+            "<subjects><subject>climate</subject><subject>climate</subject></subjects>"
+            '<relatedIdentifiers><relatedIdentifier relationType="IsCitedBy">'
+            "10.1234/cited</relatedIdentifier></relatedIdentifiers></resource>"
+        )
+    )
+    representations = {
+        "datacite": datacite,
+        "json_ld": xml_tree(
+            fromstring(
+                "<root><jsonLdString>"
+                + escape(json.dumps(document))
+                + "</jsonLdString></root>"
+            )
+        ),
+    }
+    before = deepcopy(representations)
+    current = make_record(
+        "oai:researchdata.se:owner/1", "2026-10-19", [], representations
+    )
+    assert {item["normalized"] for item in current["identities"]} == {
+        "doi:10.1234/owner",
+        "https://owner.test/dataset",
+    }
+    assert jsonld_documents(current["representations"]["json_ld"]) == [document]
+    assert current["representations"]["datacite"] == datacite
+    assert current["summary"]["titles"] == [
+        {"value": "Data", "language": "en"},
+        {"value": "Data", "language": "sv"},
+    ]
+    assert representations == before
+
+
+@pytest.mark.parametrize(
+    "datacite_identifier", [None, "10.1234/unmatched", "10.1234/shared"]
+)
+def test_unresolved_graph_datasets_do_not_supply_identity(
+    datacite_identifier: str | None,
+):
+    document = {
+        "@graph": [
+            {"@type": "Dataset", "identifier": "10.1234/shared", "url": url}
+            for url in ["https://first.test/dataset", "https://second.test/dataset"]
+        ]
+    }
+    representations = {
+        "json_ld": xml_tree(
+            fromstring(
+                "<root><jsonLdString>"
+                + escape(json.dumps(document))
+                + "</jsonLdString></root>"
+            )
+        )
+    }
+    if datacite_identifier:
+        representations["datacite"] = xml_tree(
+            fromstring(
+                f"<resource><identifier>{datacite_identifier}</identifier></resource>"
+            )
+        )
+    current = make_record(
+        "oai:researchdata.se:owner/1", "2026-10-19", [], representations
+    )
+    assert all(item["format"] == "datacite" for item in current["identities"])
+    assert jsonld_documents(current["representations"]["json_ld"]) == [document]

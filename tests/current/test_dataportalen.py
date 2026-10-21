@@ -23,6 +23,31 @@ RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 XSD = "http://www.w3.org/2001/XMLSchema#"
 
 
+async def test_unexpected_empty_catalog_cannot_remove_existing_records():
+    transport = EndpointTransport(
+        lambda request: httpx.Response(
+            200,
+            json={
+                CATALOG: {
+                    RDF + "type": [{"type": "uri", "value": DCAT + "Catalog"}],
+                    DCAT + "dataset": [],
+                }
+            },
+        )
+    )
+    config = SimpleNamespace(
+        sparql_url="https://test/sparql",
+        catalog_metadata_url="https://test/catalog",
+        catalog_uri=CATALOG,
+        identity_batch_size=100,
+    )
+    try:
+        with pytest.raises(ValueError, match="unexpectedly empty"):
+            await harvest_dataportalen(transport, config, {URI: {"uri": URI}})
+    finally:
+        await transport.client.aclose()
+
+
 class EndpointTransport:
     def __init__(self, handler: Any):
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
