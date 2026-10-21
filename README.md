@@ -67,9 +67,13 @@ Default tests are offline. Live acceptance is a separate full harvest and subseq
 
 ### Verification status on 21 October 2026
 
-The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 86 offline tests pass, including publication against a real local Git remote.
+The [full GitHub harvest](https://github.com/nordicintel/researchdata-harvester/actions/runs/39613648484) completed and published 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 links, 4,394 external resource outcomes and 24,749 file records. OAI and sitemap dataset membership matched exactly. All 6,691 Researchdata source representation sets matched the migrated metadata exactly. All migrated dataset identities and relationships were retained. Every previous file remains represented; 650 URL changes were percent-encoding differences, and 1,313 additional file records were discovered.
 
-Full live retrieval has verified both catalog inventories. A new full run is in progress with external failures recorded as unavailable, including the [SNSN Kiruna dataset landing page](https://www.snsn.se/data/Kir23.php), which returned HTTP 500. Full-output comparison, an incremental rerun and GitHub workflow execution remain pending; the old database and exports have therefore not been deleted.
+The full run took 2,343 seconds and made 22,829 HTTP requests including redirects and retries. External outcomes were 2,500 available, 310 represented by Researchdata itself, 1,338 unavailable, 241 restricted and five unsupported. Persistent upstream HTTP 503 responses accounted for much of the retry work. Completion does not mean every external resource or research file is accessible.
+
+The [incremental GitHub harvest](https://github.com/nordicintel/researchdata-harvester/actions/runs/39619862689) also completed and published. It reused 6,687 Researchdata records, fetched four records per format within the overlap window, and kept all collection counts unchanged. Dataportalen metadata, links and the confirmed mapping file were byte-identical. It received 83 HTTP 304 responses, made 17,968 HTTP requests and took 1,617 seconds. External resources recovered independently: 3,809 are available, 31 unavailable, 239 restricted, five unsupported and 310 represented by Researchdata itself.
+
+The rerun exposed only an ordering difference in four refreshed identity-evidence lists. A deterministic ordering fix now passes a regression across three separate Python hash seeds. All source metadata and identity evidence values were unchanged. The 87 offline tests pass, and GitHub validation passed on Ubuntu with Python 3.12. Eight existing downloads passed integrity checks and remain in the local downloads folder. The obsolete SQLite database and export generations were moved to the Windows Recycle Bin after acceptance. Current output occupies about 89.8 MB across 83 files; the largest file is 12.3 MB.
 
 ## Migrate the former SQLite catalog
 
