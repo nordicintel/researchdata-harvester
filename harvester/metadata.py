@@ -109,6 +109,14 @@ def owned_datasets(document: Any, anchors: set[str]) -> list[dict[str, Any]]:
         ]
         if len(entities) != 1:
             return []
+    elif entities and anchors:
+        identifiers = {
+            normalize_identity(value)
+            for field in ("identifier", "@id", "url")
+            for value in scalar_values(entities[0].get(field, []))
+        }
+        if identifiers and not identifiers & anchors:
+            return []
     return entities
 
 

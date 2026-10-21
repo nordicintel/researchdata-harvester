@@ -150,6 +150,40 @@ async def test_ambiguous_links_do_not_attribute_dataportalen_files():
     assert files == []
 
 
+async def test_doi_resolution_requests_landing_page_without_crosscite_negotiation():
+    def handler(request):
+        assert request.headers["accept"] == "text/html"
+        return httpx.Response(
+            200,
+            text='<meta name="citation_title" content="Dataset">',
+            headers={"content-type": "text/html"},
+        )
+
+    external, _ = await enrich_records(
+        FakeTransport(handler), research("10.1234/current"), {}, [], []
+    )
+    assert external[0]["status"] == "available"
+
+
+@pytest.mark.parametrize("wrapped", [True, False])
+async def test_single_different_external_dataset_never_owns_current_files(wrapped):
+    dataset = {
+        "@type": "Dataset",
+        "@id": "https://example.org/older",
+        "distribution": {"contentUrl": "https://example.org/older.csv"},
+    }
+    payload = {"@graph": [dataset]} if wrapped else dataset
+    external, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(200, json=payload)),
+        research("https://example.org/current"),
+        {},
+        [],
+        [],
+    )
+    assert files == []
+    assert external[0]["metadata"] == payload
+
+
 async def test_conditional_304_reuses_metadata_without_mutating_previous():
     previous = [
         {

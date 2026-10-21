@@ -138,6 +138,9 @@ class _LandingParser(HTMLParser):
 
 def _documents(value: Any, anchors: set[str] | None = None) -> Iterator[dict[str, Any]]:
     if isinstance(value, dict):
+        if anchors is not None and "Dataset" in str(value.get("@type", "")):
+            if not owned_datasets(value, anchors):
+                return
         if "@graph" in value:
             nodes = {
                 entity["@id"]: entity
@@ -461,6 +464,8 @@ async def enrich_records(
         old = previous_by_url.get(url, {})
         validators = old.get("validators", {})
         headers = {"Accept": "application/json, application/ld+json, text/html;q=0.8"}
+        if urlsplit(url).hostname in {"doi.org", "dx.doi.org"}:
+            headers["Accept"] = "text/html"
         if validators.get("etag"):
             headers["If-None-Match"] = validators["etag"]
         if validators.get("last_modified"):
