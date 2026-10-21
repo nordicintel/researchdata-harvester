@@ -14,6 +14,7 @@ Run these checks before committing:
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
+uv run pyright
 uv run python -m pytest
 ```
 
@@ -21,7 +22,11 @@ Use `uv run ruff check --fix .` and `uv run ruff format .` to apply lint fixes
 and formatting. Ruff uses 120-character lines, double quotes and space
 indentation. Write English identifiers, type annotations and Google-style
 docstrings; use absolute imports. Strict mypy checks `harvester/` and `scripts/`.
-PyLD has no type stubs, so only its imports are exempted from missing-stub errors.
+Pyright also checks these modules using the same analysis engine as Pylance.
+VS Code defaults to `.venv`; if it already saved another interpreter, run
+**Python: Select Interpreter** and select this repository’s `.venv`. PyLD lacks
+a `py.typed` marker, so mypy exempts its imports; Pyright still examines its
+inline annotations.
 
 The Validate workflow runs these offline checks on pushes and pull requests.
 It does not run a network harvest. Splitter tests stay outside the default

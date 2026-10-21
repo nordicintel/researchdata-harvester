@@ -579,6 +579,8 @@ def _normalize(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Canonicalize RDF/JSON or JSON-LD in a worker, with a cache-backed loader."""
     dropped: set[str] = set()
+    # PyLD accepts internal contextResolver/rdfDirection options absent from its
+    # public option types; cast only at that library boundary.
     options = {
         "algorithm": "URDNA2015",
         "base": source_url,
@@ -629,15 +631,17 @@ def _normalize(
                     )
         normalized = jsonld.normalize(
             jsonld.JsonLdProcessor.to_nquads({"@default": triples}),
-            {**options, "inputFormat": "application/n-quads"},
+            cast(jsonld.NormalizeOptions, {**options, "inputFormat": "application/n-quads"}),
         )
     else:
         expanded = jsonld.expand(
             document,
-            options=options,
+            options=cast(jsonld.ExpandOptions, options),
             on_property_dropped=lambda name: dropped.add(name or "<unmapped>"),
         )
-        normalized = jsonld.normalize(expanded, options)
+        normalized = jsonld.normalize(expanded, cast(jsonld.NormalizeOptions, options))
+    if not isinstance(normalized, dict):
+        raise ValueError("Expected a normalized RDF dataset; N-Quads string output is not enabled")
     scope = hashlib.sha256(source_url.encode()).hexdigest()[:16]
 
     def scoped(value: str) -> str:
