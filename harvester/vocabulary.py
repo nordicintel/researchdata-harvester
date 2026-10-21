@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: NOASSERTION
 # Copyright (c) 2026 NordicIntel
-"""Checked-in RDF names and projection mappings for schema.sql.
+"""RDF vocabulary mappings and the shared, gzipped JSON metadata cache.
 
 Use PREDICATE_COLUMNS[context].get(expanded_predicate) to find a descriptive
 column. Contexts are dataset (both tables), agent, distribution and service.
@@ -30,8 +30,38 @@ prove tabular data. Eligibility still requires resource verification.
 Only explicit equivalence predicates are listed for identity assertions.
 Identifiers require context-aware comparison; titles, citations, dct:relation,
 isVersionOf and previousVersion never establish identity through this module.
-Fetched vocabulary labels/definitions belong in data/current/rdf-cache.json.gz,
-alongside fetched shared entities; this file contains no cache implementation.
+Cache usage (inside the async harvest, with its shared HTTP client):
+
+    cache = RdfCache.load(Path("data/current/rdf-cache.json.gz"))
+    entry = await cache.fetch(uri, client, kind="entity", required=True)
+    cache.save(Path("data/work/candidate/rdf-cache.json.gz"), referenced={uri})
+
+load() starts empty if the file is absent; save() creates it and its directory.
+Neither importing nor loading a missing cache writes to disk. Save only a
+successful candidate, then publish it with the tables and manifest. An unchanged
+save leaves the existing file untouched. Corrupt caches fail explicitly.
+
+fetch() accepts JSON metadata objects (including RDF/JSON and JSON-LD) without
+altering terms, language tags, datatypes, arrays or linked nodes. For other RDF
+representations, pass a decoder returning a JSON-compatible dictionary; the
+source parser owns RDF conversion and deterministic blank-node identities.
+source_url can point to a metadata API or vocabulary document instead of the
+entity URI. Use one cache key per shared vocabulary document, not one copy of
+an entire ontology per term. No recursive crawling is performed here.
+
+Vocabulary entries are reused unless full=True or their prior retrieval failed.
+Mutable entities are conditionally requested once per cache instance/run, only
+when a caller requests them. Without validators, fetch the complete response.
+The supplied HTTP client owns transport configuration/retries; this module adds
+no competing retry layer. Failures retain prior data with outcome='unavailable'
+and stale=True. required=True raises CacheFetchError instead of allowing the
+caller to treat that outcome as fresh metadata. Failed entries retry next run.
+
+Parallel jobs load the same read-only baseline and serialize changes() into
+their temporary artifacts. The build job loads the baseline, merge()s all job
+updates (conflicts fail), then save()s once. Pass the retained entity URI set as
+referenced to remove unused mutable entries while keeping vocabulary definitions.
+No raw XML/RDF strings, observation data or retrieval-time history are stored.
 
 Sources:
     https://docs.dataportal.se/registry/api/
@@ -40,6 +70,20 @@ Sources:
     https://www.w3.org/TR/vcard-rdf/
     https://docs.researchdata.se/metadata/schema-org-json-ld/
 """
+
+import asyncio
+import gzip
+import io
+import json
+import logging
+import os
+import tempfile
+from collections.abc import Callable, Collection, Mapping
+from pathlib import Path
+from typing import Literal
+
+import httpx
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, model_validator
 
 # ------------------------------------------------------------------------------
 # Namespaces and normalization projections
@@ -194,3 +238,225 @@ IDENTITY_PREDICATES: frozenset[str] = frozenset(
         "http://schema.org/sameAs",
     }
 )
+
+# ------------------------------------------------------------------------------
+# Shared RDF metadata cache
+# ------------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
+class CacheEntry(BaseModel):
+    """One source description and the outcome of its latest attempted refresh."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    kind: Literal["vocabulary", "entity"]
+    source_url: str
+    data: dict[str, JsonValue] | None = None
+    etag: str | None = None
+    last_modified: str | None = None
+    outcome: Literal["available", "unavailable"] = "available"
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def require_available_data(self) -> "CacheEntry":
+        """Reject a successful cache entry that contains no representation."""
+        if self.outcome == "available" and self.data is None:
+            raise ValueError("An available cache entry must contain metadata")
+        return self
+
+    @property
+    def stale(self) -> bool:
+        """Whether a failed refresh is retaining an earlier source description."""
+        return self.outcome == "unavailable" and self.data is not None
+
+
+class CacheFetchError(RuntimeError):
+    """A required source could not be refreshed; publication must not proceed."""
+
+
+_ENTRIES = TypeAdapter(dict[str, CacheEntry])
+_METADATA = TypeAdapter(dict[str, JsonValue])
+
+
+class RdfCache:
+    """Keep a run's shared lookups in memory and explicitly save a candidate."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, CacheEntry] = {}
+        self._baseline: dict[str, CacheEntry] = {}
+        self._fetched: dict[str, str] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    @classmethod
+    def load(cls, path: Path) -> "RdfCache":
+        """Read a URI-keyed gzip JSON file; missing means empty, corrupt raises."""
+        cache = cls()
+        if path.exists():
+            with gzip.open(path, "rt", encoding="utf-8") as stream:
+                cache._entries = _ENTRIES.validate_python(json.load(stream))
+            cache._baseline = cache._entries.copy()
+        return cache
+
+    async def fetch(
+        self,
+        uri: str,
+        client: httpx.AsyncClient,
+        *,
+        kind: Literal["vocabulary", "entity"] = "entity",
+        source_url: str | None = None,
+        full: bool = False,
+        required: bool = False,
+        decoder: Callable[[httpx.Response], dict[str, JsonValue]] | None = None,
+    ) -> CacheEntry:
+        """Retrieve/revalidate once per run; share concurrent requests by URI.
+
+        A decoder should raise ValueError for malformed or unsupported metadata.
+        Unexpected programming errors propagate. Returned entries are independent
+        copies so a consumer cannot mutate metadata held by another consumer.
+        """
+        async with self._locks.setdefault(uri, asyncio.Lock()):
+            previous = self._entries.get(uri)
+            url = source_url or (previous.source_url if previous else uri)
+            if previous and previous.kind != kind:
+                raise ValueError(f"Cache kind changed for {uri}; use a consistent key.")
+            if uri in self._fetched and self._fetched[uri] != url:
+                raise ValueError(f"Conflicting metadata URLs for {uri} in one run.")
+            reusable = (
+                previous is not None
+                and previous.source_url == url
+                and previous.outcome == "available"
+                and previous.data is not None
+                and kind == "vocabulary"
+                and not full
+            )
+            if uri not in self._fetched and not reusable:
+                headers = {
+                    "Accept": "application/rdf+json, application/ld+json, application/json"
+                }
+                if (
+                    previous
+                    and previous.data is not None
+                    and previous.source_url == url
+                ):
+                    if previous.etag:
+                        headers["If-None-Match"] = previous.etag
+                    if previous.last_modified:
+                        headers["If-Modified-Since"] = previous.last_modified
+                try:
+                    response = await client.get(
+                        url, headers=headers, follow_redirects=True
+                    )
+                    if response.status_code == 304:
+                        if (
+                            not previous
+                            or previous.data is None
+                            or not (
+                                "If-None-Match" in headers
+                                or "If-Modified-Since" in headers
+                            )
+                        ):
+                            raise ValueError(
+                                "Received 304 without a cached representation"
+                            )
+                        entry = previous.model_copy(
+                            update={
+                                "outcome": "available",
+                                "error": None,
+                                "etag": response.headers.get("etag", previous.etag),
+                                "last_modified": response.headers.get(
+                                    "last-modified", previous.last_modified
+                                ),
+                            }
+                        )
+                    else:
+                        response.raise_for_status()
+                        data = _METADATA.validate_python(
+                            decoder(response) if decoder else response.json()
+                        )
+                        entry = CacheEntry(
+                            kind=kind,
+                            source_url=url,
+                            data=data,
+                            etag=response.headers.get("etag"),
+                            last_modified=response.headers.get("last-modified"),
+                        )
+                    logger.debug("RDF cache refresh: HTTP %s", response.status_code)
+                except (httpx.HTTPError, ValueError) as error:
+                    reason = (
+                        f"HTTP {error.response.status_code}"
+                        if isinstance(error, httpx.HTTPStatusError)
+                        else type(error).__name__
+                    )
+                    entry = (
+                        previous
+                        or CacheEntry(kind=kind, source_url=url, outcome="unavailable")
+                    ).model_copy(update={"outcome": "unavailable", "error": reason})
+                    logger.debug("RDF cache refresh failed: %s", reason)
+                self._entries[uri] = entry
+                self._fetched[uri] = url
+            entry = self._entries[uri]
+            if required and entry.outcome != "available":
+                raise CacheFetchError(f"Required RDF resource {uri}: {entry.error}")
+            return entry.model_copy(deep=True)
+
+    def changes(self) -> dict[str, dict[str, JsonValue]]:
+        """Return JSON-compatible updates for a fetch job's temporary artifact."""
+        return {
+            uri: entry.model_dump(mode="json")
+            for uri, entry in sorted(self._entries.items())
+            if entry != self._baseline.get(uri)
+        }
+
+    def merge(self, *updates: Mapping[str, object]) -> None:
+        """Merge worker updates atomically; differing updates for one URI fail."""
+        pending = _ENTRIES.validate_python(self.changes())
+        for update in updates:
+            for uri, entry in _ENTRIES.validate_python(update).items():
+                if uri in pending and pending[uri] != entry:
+                    raise ValueError(f"Conflicting RDF cache updates for {uri}")
+                pending[uri] = entry
+        self._entries.update(pending)
+
+    def save(self, path: Path, *, referenced: Collection[str] | None = None) -> None:
+        """Create/replace a candidate atomically with deterministic gzip JSON.
+
+        Omit referenced to retain all entries, including when writing an empty
+        initial cache. Supply it during the final build to prune unused entities.
+        """
+        entries = {
+            uri: entry.model_dump(mode="json")
+            for uri, entry in self._entries.items()
+            if referenced is None or uri in referenced or entry.kind == "vocabulary"
+        }
+        payload = (
+            json.dumps(
+                entries,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+        buffer = io.BytesIO()
+        with gzip.GzipFile(
+            filename="", mode="wb", fileobj=buffer, mtime=0, compresslevel=9
+        ) as archive:
+            archive.write(payload)
+        compressed = buffer.getvalue()
+        if path.exists() and path.read_bytes() == compressed:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(compressed)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
