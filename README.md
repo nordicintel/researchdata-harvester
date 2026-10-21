@@ -67,7 +67,7 @@ Default tests are offline. Live acceptance is a separate full harvest and subseq
 
 ### Verification status on 21 October 2026
 
-The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 85 offline tests pass, including publication against a real local Git remote.
+The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 86 offline tests pass, including publication against a real local Git remote.
 
 Full live retrieval has verified both catalog inventories. A new full run is in progress with external failures recorded as unavailable, including the [SNSN Kiruna dataset landing page](https://www.snsn.se/data/Kir23.php), which returned HTTP 500. Full-output comparison, an incremental rerun and GitHub workflow execution remain pending; the old database and exports have therefore not been deleted.
 

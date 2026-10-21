@@ -734,3 +734,20 @@ async def test_stale_external_payload_never_acquires_new_owners_across_failures(
     second, files = await enrich_records(transport, {"b": record}, {}, [], repeated)
     assert second[0]["metadata"] is None
     assert files == []
+
+
+async def test_external_type_object_is_preserved_without_rdf_coercion():
+    payload = {
+        "custom": {"type": {"name": "Source type"}},
+        "distribution": {"contentUrl": "https://example.org/data.csv"},
+    }
+    external, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(200, json=payload)),
+        research("https://example.org/current"),
+        {},
+        [],
+        [],
+    )
+    assert external[0]["status"] == "available"
+    assert external[0]["metadata"] == payload
+    assert files[0]["url"] == "https://example.org/data.csv"

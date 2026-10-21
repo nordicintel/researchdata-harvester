@@ -217,7 +217,7 @@ def _file_metadata(document: Any, anchors: set[str] | None = None) -> list[dict]
             if isinstance(value, dict) and (
                 "@value" in value
                 or "@id" in value
-                or value.get("type") in {"literal", "uri"}
+                or value.get("type") in ("literal", "uri")
             ):
                 value = value.get("@value", value.get("@id", value.get("value")))
             normalized[key] = value
