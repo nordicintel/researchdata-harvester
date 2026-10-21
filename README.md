@@ -73,4 +73,4 @@ uv run python -m scripts.migrate data/catalog.sqlite --report .audit/migration.j
 
 Migration requires an absent destination. It opens SQLite read-only, retains current source metadata and relationships, and verifies existing downloads at their moved paths. The local download manifest stays under `data/downloads/`. Keep the old database until migration comparisons and live acceptance succeed.
 
-The unchanged `src/researchdata_harvester` directory and its original tests are reference material. New execution does not import that package. `pyproject.toml` manages dependencies without building or installing a library. [PROJECT_SCOPE.md](PROJECT_SCOPE.md) records the agreed scope.
+The unchanged `src/researchdata_harvester` directory is reference material. New execution does not import that package. Tests cover the current runner; obsolete package tests have been removed. `pyproject.toml` manages dependencies without building or installing a library. [PROJECT_SCOPE.md](PROJECT_SCOPE.md) records the agreed scope.
