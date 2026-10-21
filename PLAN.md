@@ -2,7 +2,7 @@
 
 ## 1. Target structure
 
-Use the following tree as a suggested upper bound, not a requirement to create every file: at most six implementation modules, two executable scripts and four test modules, with five workflow files (one harvest coordinator, three reusable stages and one validation workflow). Names and responsibilities may change after the working prototype reveals the useful module seams, but the final repository must contain no more than eight production Python files and twelve Python files including tests. Prefer fewer files and fewer tests where they cover the essential behavior. Use DuckDB for schema enforcement, SQL updates, validation and Parquet output. Published Parquet files, the compact inventory and one gzipped JSON RDF cache remain the persisted state; no permanent DuckDB database is required.
+Use the following tree as a suggested upper bound, not a requirement to create every file: at most six implementation modules, two executable scripts and four test modules, with two workflows. Names and responsibilities may change after the working prototype reveals the useful module seams, but the final repository must contain no more than eight production Python files and twelve Python files including tests. Prefer fewer files and fewer tests where they cover the essential behavior. Use DuckDB for schema enforcement, SQL updates, validation and Parquet output. Published Parquet files, the compact inventory and one gzipped JSON RDF cache remain the persisted state; no permanent DuckDB database is required.
 
 ```text
 researchdata-harvester/
@@ -37,9 +37,6 @@ researchdata-harvester/
 ├── .github/
 │   └── workflows/
 │       ├── harvest.yml
-│       ├── fetch-dataportalen.yml
-│       ├── fetch-researchdata.yml
-│       ├── publish.yml
 │       └── validate.yml
 │
 └── data/
@@ -95,10 +92,7 @@ The target is exactly two Parquet files, one per table. Numbered parts are an ex
 
 | File                                | Role                                                                                                                                                                                                            |
 | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/workflows/harvest.yml` | The sole harvest coordinator: daily at 03:17 UTC or manually, enumerate inventory and detect changes, then call the reusable fetch workflows in parallel and publication after both succeed. |
-| `.github/workflows/fetch-dataportalen.yml` | A `workflow_call` workflow that retrieves complete Dataportalen metadata for the shared change list and uploads its results and RDF-cache updates as temporary artifacts. |
-| `.github/workflows/fetch-researchdata.yml` | A `workflow_call` workflow that resolves Researchdata/external metadata, verifies candidate data resources and uploads its results and RDF-cache updates as temporary artifacts. |
-| `.github/workflows/publish.yml` | A `workflow_call` workflow that merges both fetch artifacts, builds and validates the two Parquet outputs and accompanying state, and publishes the generated-data-only commit after checking the expected `main` head. |
+| `.github/workflows/harvest.yml`     | Run daily at 03:17 UTC or manually, with inventory, two parallel fetch jobs and one dependent build/publication job.                                                                                            |
 | `.github/workflows/validate.yml`    | Run offline tests, Ruff, formatting checks and published-data validation for code and proposed data changes.                                                                                                    |
 | `data/current/datasets.parquet`     | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. Keep this as one file whenever it fits below 100 MB.                                   |
 | `data/current/dataportalen.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. Keep this as one file whenever it fits below 100 MB.                                                         |
@@ -198,19 +192,7 @@ Keep `--config`, `--destination` and `--report`. Add stage selection for `invent
 - Preserve completed record results in the existing temporary stage artifacts as work proceeds. Allow a rerun against the same work directory to reuse those results and retry failed or unfinished records when the input plan, configuration and implementation revision are unchanged. This is temporary artifact reuse, not a new persistent checkpoint database or run-history system.
 - After an interrupted run, rerun only the failing dataset or stage before attempting the full catalog again. The README must include copyable scoped, debug and stage-rerun commands.
 
-### Workflow coordination
-
-Use five workflow files, with one coordinated harvest run. `harvest.yml` owns the schedule/manual trigger, run-level concurrency and job dependencies. The three stage workflows expose `workflow_call`; do not chain independently triggered runs through `workflow_run` or dispatch events.
-
-1. The inventory job records the base `main` commit, configuration, full/scoped settings and the shared change list in a run-specific artifact.
-2. The `fetch-dataportalen` and `fetch-researchdata` caller jobs both depend on inventory and invoke their respective reusable workflows in parallel. Both check out the recorded base commit and consume the same inventory artifact. Each writes a distinctly named result artifact, including its RDF-cache updates; neither modifies published data.
-3. The `publish` caller job depends on inventory and both fetch jobs through `needs`. It invokes `publish.yml` only after the required stages succeed and there are changes or refreshes to apply. Removal-only changes must still reach publication even if the fetch stages have no records to retrieve.
-4. `publish.yml` consumes those same-run artifacts, merges cache updates, builds and validates the complete candidate, and verifies the expected remote `main` head before creating the data-only commit. It cannot publish scoped runs or incomplete required-source results.
-5. `validate.yml` remains a separate code/catalog validation workflow for repository changes. Default tests exclude the commit-hook splitter tests; run those explicitly when the hook script changes.
-
-Pass artifact names and the base commit through explicit workflow inputs and inventory outputs. Retain temporary artifacts for one day and skip downstream work when inventory finds no changes. Give fetch jobs read-only repository permissions; grant write permission only to the publication caller/job. Keep concurrency serialization at the coordinator level so reusable workflows do not contend for the same concurrency group.
-
-The workflow files only orchestrate the existing Python stage commands; do not duplicate retrieval, validation or publication logic in YAML.
+The scheduled workflow runs inventory first, starts the two fetch jobs in parallel, then builds and publishes after both complete. Use run-specific artifacts, retained for one day; skip unnecessary jobs when nothing needs processing.
 
 - Serialize harvest runs without cancelling an active run.
 - Block publication after required-source failures.
