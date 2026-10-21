@@ -1,8 +1,63 @@
-# Simplify the Researchdata harvester with DuckDB
+# Implement the simplified Researchdata harvester with DuckDB
 
-## 1. Target structure
+## 1. Goal, scope and existing work
 
-Use the following tree as a suggested upper bound, not a requirement to create every file: at most six implementation modules, two executable scripts and four test modules, with five workflow files (one harvest coordinator, three reusable stages and one validation workflow). Names and responsibilities may change after the working prototype reveals the useful module seams, but the final repository must contain no more than eight production Python files and twelve Python files including tests. Prefer fewer files and fewer tests where they cover the essential behavior. Use DuckDB for schema enforcement, SQL updates, validation and Parquet output. Published Parquet files, the compact inventory and one gzipped JSON RDF cache remain the persisted state; no permanent DuckDB database is required.
+Build a small, directly executed harvester that publishes metadata for current Researchdata catalog entries whose data can actually be retrieved in tabular form.
+
+Use Dataportalen’s explicitly identified Researchdata catalog as the inventory. Resolve its linked Researchdata and external resources, retrieve their available metadata, and verify actual tabular data before admitting a new dataset to the published tables.
+
+The normal incremental run must refresh new or changed entries and retry transient failures. It must remove entries whose catalog membership or eligibility has explicitly ended.
+
+Publish two typed Parquet tables, a compact inventory, one compressed semantic cache and a manifest. GitHub Actions runs the same Python commands used locally.
+
+### Scope decisions
+
+- Harvest the current catalog only.
+- Preserve exact source identifiers, including revision suffixes, without maintaining historical versions or following previous-version links.
+- Exclude datasets explicitly marked `NON_PUBLIC`.
+- Exclude resources requiring an account, API key, application, payment or individual access approval.
+- Allow unspecified access rights and simple licence acknowledgements.
+- Do not require a Dataportalen distribution. A dataset can qualify through an explicitly linked repository containing retrievable tabular data.
+- Require evidence of actual data. Public metadata, a download-looking URL or a declared file format is insufficient.
+- Exclude documents, metadata-only responses, imagery and map layers.
+- Preserve complete available metadata for processed datasets, including attributes not projected into familiar columns.
+- Retrieve external metadata during harvesting. Do not defer enrichment until a consumer selects a dataset.
+- Do not publish research observations, sample rows or downloaded research files.
+- Preserve licence information without introducing a commercial-use filter.
+- Do not add a server, installable package, adapter framework, persistent database, historical snapshots or persistent pagination checkpoints.
+
+### Incremental freshness
+
+Dataportalen’s registry modification value determines which unchanged catalog entries can be skipped.
+
+For selected entries, revalidate linked mutable metadata independently. Their parent dataset’s timestamp does not prove that the linked resource is unchanged.
+
+Unchanged entries do not trigger a fresh crawl of all their external resources. Consequently, an external change that does not propagate to Dataportalen is discovered when the entry is otherwise selected, a previous transient failure is retried, or `--full` is run.
+
+Keep that limitation explicit. Do not introduce a periodic full refresh or independent Researchdata inventory behind the user’s back.
+
+### Reuse the work already implemented
+
+The repository already contains:
+
+- `harvester/schema.sql`, with two typed DuckDB tables and a publication-validation view.
+- `harvester/vocabulary.py`, with mappings, semantic resolution and a deterministic gzip JSON cache.
+- Support for RDF/JSON, JSON-LD, JSON Schema and schemas embedded in OpenAPI JSON documents.
+- `scripts/split_data_files.py`, its installed-hook support and separate tests.
+- Locked runtime and development dependencies.
+- Python 3.12 configuration, Ruff, mypy, Pyright and an offline validation workflow.
+
+Integrate these components. Do not recreate them under different names.
+
+The earlier implementation and published JSONL data currently reside under the ignored `legacy/` directory. Treat them as a read-only comparison source during implementation. The new code must not import `legacy`.
+
+## 2. Final repository structure
+
+Keep no more than **eight production Python files and twelve Python files including tests**.
+
+The existing splitter and its test count toward these limits. Use five harvester modules, three executable scripts and four test modules. Do not add empty `__init__.py` files merely for convention.
+
+The target structure is:
 
 ```text
 researchdata-harvester/
@@ -11,28 +66,34 @@ researchdata-harvester/
 ├── pyproject.toml
 ├── uv.lock
 ├── config.toml
+├── .python-version
 ├── .gitignore
 ├── .gitattributes
 │
+├── .vscode/
+│   └── settings.json
+│
+├── .githooks/
+│   └── pre-commit
+│
 ├── harvester/
 │   ├── runtime.py
+│   ├── vocabulary.py
 │   ├── dataportalen.py
 │   ├── researchdata.py
-│   ├── external.py
-│   ├── verify.py
 │   ├── output.py
-│   ├── schema.sql
-│   └── vocabulary.json
+│   └── schema.sql
 │
 ├── scripts/
 │   ├── sync.py
-│   └── publish.py
+│   ├── publish.py
+│   └── split_data_files.py
 │
 ├── tests/
 │   ├── test_inventory.py
 │   ├── test_metadata.py
-│   ├── test_verification.py
-│   └── test_publication.py
+│   ├── test_pipeline.py
+│   └── test_split_data_files.py
 │
 ├── .github/
 │   └── workflows/
@@ -49,188 +110,1159 @@ researchdata-harvester/
     │   ├── inventory.json
     │   ├── rdf-cache.json.gz
     │   └── manifest.json
-    ├── work/                         # Ignored, temporary.
-    └── downloads/                    # Ignored, preserved existing downloads.
+    ├── work/                         # Ignored temporary work and reports.
+    └── downloads/                    # Ignored existing downloads, preserved.
 ```
 
-The target is exactly two Parquet files, one per table. Numbered parts are an exception only when the actual compressed table cannot fit below the 100 MB per-file limit; never pre-partition by hashes, publishers, worker count or arbitrary row counts. Environments and tool caches are ignored and omitted from this tree.
+`legacy/` remains temporarily during implementation and comparison. It is absent from the final active structure after acceptance.
 
-### Root files
+### Root and configuration files
 
-| File             | Role                                                                                                                                                                                                         |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `README.md`      | The operating guide covering setup, commands, inclusion rules, output schemas, maintenance and troubleshooting. Include external API documentation and examples for querying the Parquet tables with DuckDB. |
-| `PLAN.md`        | The agreed implementation scope, sequence and acceptance criteria. Update this file when the user changes those decisions.                                                                                   |
-| `pyproject.toml` | Dependency-only Python 3.12+ project configuration, test settings and Ruff settings. Keep `package = false`; add no build configuration or installed CLI.                                                    |
-| `uv.lock`        | Reproducible dependency versions for local execution and Actions.                                                                                                                                            |
-| `config.toml`    | Endpoints, paths, concurrency, timeouts, retry settings and verification limits. Default binary verification cap is 32 MiB.                                                                                  |
-| `.gitignore`     | Ignore temporary work, downloads, local configuration, environments and caches.                                                                                                                              |
-| `.gitattributes` | Treat generated current data as binary to prevent newline conversion from invalidating checksums.                                                                                                            |
+| File | Role |
+|---|---|
+| `README.md` | The operating guide for setup, harvesting, scoped diagnosis, output consumption, maintenance and publication. Describe implemented behavior and its limits. |
+| `PLAN.md` | This implementation specification. Replace obsolete instructions with this version while preserving the agreed requirements. |
+| `pyproject.toml` | Dependency-only project configuration, development checks and splitter settings. Keep `package = false` and no installed CLI entry point. |
+| `uv.lock` | Locked dependencies shared by local execution and Actions. Update through uv. |
+| `config.toml` | Checked-in endpoints, paths, concurrency, network limits and verification settings. Document every setting in the README. |
+| `.python-version` | Select Python 3.12 for local execution and Actions. |
+| `.gitignore` | Ignore temporary work, local reports, downloads, environments, caches and `config.local.toml`. Explicitly allow every published current file, including `rdf-cache.json.gz`. |
+| `.gitattributes` | Preserve `data/current/** -text` so Git newline conversion cannot invalidate checksums. |
+| `.vscode/settings.json` | Select the repository’s `.venv` as the default Python environment. Retain the existing editor configuration. |
+| `.githooks/pre-commit` | Invoke the existing oversized-data-file splitter. Do not duplicate publication validation here. |
 
-### Implementation files
+### Python and SQL files
 
-| File                        | Role                                                                                                                                                                                                                                    |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `harvester/runtime.py`      | Load and validate configuration and provide the shared asynchronous HTTP client. Centralize logging setup, concurrency limits, timeouts, retries and `Retry-After` handling.                                                            |
-| `harvester/dataportalen.py` | Own the scoped inventory query, change detection and retrieval of complete Dataportalen metadata, including related entities. Reuse and revalidate cached RDF entities; confirm membership and exclusions before removal.               |
-| `harvester/researchdata.py` | Resolve current Researchdata identities and retrieve available dataset metadata. Reuse confirmed associations and exact identities without full-catalog OAI enumeration or title-based matching.                                        |
-| `harvester/external.py`     | Retrieve metadata and resource descriptions from linked repositories, including existing Zenodo, KTH, ICOS and SITES cases. Share resource lookups and report unavailable outcomes.                                                     |
-| `harvester/verify.py`       | Inspect bounded samples of candidate data resources using format-specific libraries. Return verification evidence and explicit failure or unresolved outcomes.                                                                          |
-| `harvester/output.py`       | Normalize retrieved metadata into the declared schemas, apply SQL replacements through DuckDB, validate the candidate and write Parquet plus inventory and manifest. Own local atomic replacement and interrupted-replacement recovery. |
-| `harvester/schema.sql`      | The authoritative DuckDB table definitions, including typed nested structures for repeated entities, resources and provenance. Avoid parallel schema definitions in Python.                                                             |
-| `harvester/vocabulary.json` | Checked-in namespace and predicate-to-column mappings used during normalization. Keep fetched vocabulary definitions and labels in the RDF cache, and preserve unknown source properties rather than discarding them.                   |
+| File | Role |
+|---|---|
+| `harvester/runtime.py` | Validate configuration and own shared HTTP behavior, concurrency, retries, deadlines and logging. Supply the same request behavior to source retrieval, verification and semantic resolution. |
+| `harvester/vocabulary.py` | Own namespace mappings, semantic normalization and the compressed definition/entity cache. Retain the existing resolver and extend its integration only where necessary. |
+| `harvester/dataportalen.py` | Own the scoped queries, inventory comparison, removal confirmation and complete Dataportalen metadata retrieval. Hide EntryStore response details and related-entity traversal from the coordinator. |
+| `harvester/researchdata.py` | Resolve current dataset identities, retrieve Researchdata and external metadata, discover resources and verify tabular data. Keep repository-specific handling and format inspection behind this complete operation. |
+| `harvester/output.py` | Convert retrieved metadata into the SQL schema, apply current-state replacements, validate and export the candidate. Own manifest generation, cache merging and safe local replacement. |
+| `harvester/schema.sql` | The authoritative table and nested-value definitions. Reuse the existing schema and validation view instead of maintaining a second schema in Python. |
+| `scripts/sync.py` | Parse CLI arguments and coordinate complete runs or individual stages. Keep retrieval, parsing and SQL logic inside the harvester modules. |
+| `scripts/publish.py` | Validate a completed candidate, enforce Git publication prerequisites and publish a generated-data-only commit. Reject incomplete, scoped or outdated candidates. |
+| `scripts/split_data_files.py` | Retain the existing general Parquet/JSONL splitter, including gzip support and hook installation. Its behavior remains independent of the catalog builder’s partitioning policy. |
 
-### Executable scripts and tests
+### Tests
 
-| File                         | Role                                                                                                                                                                                                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scripts/sync.py`            | A thin CLI coordinating inventory, parallel retrieval and output construction. Expose the same stages individually for Actions and collectively for local execution.                                        |
-| `scripts/publish.py`         | Validate the candidate, verify the expected Git head and create a generated-data-only commit. Reject publication races and never force-push.                                                                |
-| `tests/test_inventory.py`    | Test filtering, pagination, timestamp comparison, additions, removals and incomplete inventories.                                                                                                           |
-| `tests/test_metadata.py`     | Test identity resolution, related entities, description links, metadata fidelity and multiple legitimate associations. Cover RDF cache reuse, revalidation, refresh failures and preservation of RDF terms. |
-| `tests/test_verification.py` | Test actual rows, supported formats, licence acknowledgements, byte limits, misleading responses and access failures.                                                                                       |
-| `tests/test_publication.py`  | Test DuckDB schemas, replacements, retained stale records, deterministic output, checksums, recovery and Git publication safeguards.                                                                        |
+| File | Role |
+|---|---|
+| `tests/test_inventory.py` | Cover scoped selection, query filtering, pagination, modification comparison, additions, removals and incomplete inventories. |
+| `tests/test_metadata.py` | Preserve and adapt existing schema, semantic resolver and cache tests. Add essential identity and metadata-preservation scenarios through the working interfaces. |
+| `tests/test_pipeline.py` | Combine essential resource-verification, failure-retention, candidate-building and publication tests. Avoid separate files for every implementation module. |
+| `tests/test_split_data_files.py` | Keep splitter tests outside the default suite. Run them explicitly when the splitter changes. |
 
-### Workflows and generated files
+### Workflows
 
-| File                                | Role                                                                                                                                                                                                            |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.github/workflows/harvest.yml` | The sole harvest coordinator: daily at 03:17 UTC or manually, enumerate inventory and detect changes, then call the reusable fetch workflows in parallel and publication after both succeed. |
-| `.github/workflows/fetch-dataportalen.yml` | A `workflow_call` workflow that retrieves complete Dataportalen metadata for the shared change list and uploads its results and RDF-cache updates as temporary artifacts. |
-| `.github/workflows/fetch-researchdata.yml` | A `workflow_call` workflow that resolves Researchdata/external metadata, verifies candidate data resources and uploads its results and RDF-cache updates as temporary artifacts. |
-| `.github/workflows/publish.yml` | A `workflow_call` workflow that merges both fetch artifacts, builds and validates the two Parquet outputs and accompanying state, and publishes the generated-data-only commit after checking the expected `main` head. |
-| `.github/workflows/validate.yml`    | Run offline tests, Ruff, formatting checks and published-data validation for code and proposed data changes.                                                                                                    |
-| `data/current/datasets.parquet`     | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. Keep this as one file whenever it fits below 100 MB.                                   |
-| `data/current/dataportalen.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. Keep this as one file whenever it fits below 100 MB.                                                         |
-| `data/current/inventory.json`       | Current source membership, modification indicators, confirmed associations and processing outcomes, including excluded or unresolved candidates.                                                                |
-| `data/current/rdf-cache.json.gz`    | A URI-keyed JSON cache of fetched vocabulary definitions and shared RDF entities, compressed with gzip. Preserve RDF term types, languages, datatypes, linked nodes, source URLs and available HTTP validators. |
-| `data/current/manifest.json`        | Schema version, output filenames, counts and checksums for a consistent published generation.                                                                                                                   |
+| File | Role |
+|---|---|
+| `.github/workflows/harvest.yml` | Coordinate scheduled and manual harvesting, create the inventory artifact, and call both fetch workflows in parallel before publication. |
+| `.github/workflows/fetch-dataportalen.yml` | Retrieve complete Dataportalen metadata for the shared change list and upload temporary results and cache updates. |
+| `.github/workflows/fetch-researchdata.yml` | Retrieve Researchdata/external metadata, verify resources and upload temporary results and cache updates. |
+| `.github/workflows/publish.yml` | Build and validate the candidate from both fetch artifacts, then publish it if the expected `main` head still matches. |
+| `.github/workflows/validate.yml` | Run offline code checks and validate published data on repository changes. Keep pull-request validation enabled for proposed data changes. |
 
-## 2. Inventory and retrieval
+### Published files
 
-Use Dataportalen’s Researchdata catalog as the sole inventory.
+| File | Role |
+|---|---|
+| `datasets.parquet` | Enriched metadata and verification evidence for eligible datasets. |
+| `dataportalen.parquet` | Complete corresponding Dataportalen metadata for exactly the same dataset identities. |
+| `inventory.json` | Current source membership, modification indicators, processing outcomes, retry decisions and confirmed associations. |
+| `rdf-cache.json.gz` | Shared semantic definitions and reusable mutable metadata entities. Despite its existing name, it also stores JSON Schema definitions. |
+| `manifest.json` | Output filenames, schema version, row counts, byte sizes and SHA-256 checksums for one consistent published generation. |
 
-- Keep one predefined Solr query in `dataportalen.py`, scoped to the Researchdata registry context and excluding `NON_PUBLIC`.
-- Page in stable entry-URI order, 100 records per request. Reuse dataset metadata already included in search results.
-- Compare registry modification timestamps with previously stored registry timestamps. Refresh new or changed records, transient failures and all records under `--full`.
-- Check explicit Dataportalen catalog membership before removing missing records. Confirm newly excluded access rights; inconsistent or incomplete inventories block publication.
-- Keep current identifiers exactly, including revision suffixes, without fetching historical versions.
-- Do not add periodic full refreshes or independent Researchdata membership scans.
+## 3. Dataportalen inventory and exact requests
 
-The two fetch stages receive the same change list:
+### 3.1 Source endpoints
 
-1. Retrieve complete Dataportalen metadata through explicit related-entity lookups, shared within the run.
-2. Resolve Researchdata and external dataset resources, retrieve their available metadata and verify candidate data files.
-
-Use landing/access URLs first, then explicit dataset links in descriptions. Preserve valid confirmed associations from the existing data and use exact identifiers or verified canonical identities for new associations. Do not match on titles or cited publication identifiers.
-
-Retrieve dataset-owned structured metadata and metadata representations needed to preserve available attributes. Do not crawl unrelated navigation, citations or previous versions.
-
-### RDF cache
-
-Use one `rdf-cache.json.gz` file, handled with Python's standard-library `json` and `gzip`. This is a reusable metadata lookup cache, not another database or service; no dedicated caching module or dependency is needed.
-
-- Cache fetched vocabulary definitions and labels, publishers, contacts, distributions and other referenced RDF entities by source URI. Store complete JSON-compatible entity descriptions, including linked blank nodes and source provenance.
-- Reuse vocabulary definitions between normal runs. Fetch missing definitions when needed and refresh cached definitions during `--full`; an unavailable definition must not discard the original URI or property.
-- When processing a new or changed dataset, revalidate each referenced mutable entity once per run using its available HTTP validators. If validators are unavailable, retrieve and compare the entity; do not assume that its parent dataset timestamp describes its changes.
-- Share the fetched result across all datasets referencing that entity. Unchanged datasets do not trigger entity lookups merely because a cache exists.
-- Keep the checked-out cache read-only in parallel jobs. Each job emits cache updates in its artifact; the build stage merges them and writes one sorted, deterministically gzipped candidate cache. Conflicting updates for the same source URI fail validation rather than choosing an arbitrary winner.
-- A failed revalidation does not count as a fresh result. Apply the same required-source failure and external stale-metadata policies as uncached retrieval.
-- Remove mutable entities no longer referenced by retained records; keep vocabulary definitions for reuse. Include the cache checksum in the manifest and publish it with the tables and inventory.
-- Prefer this small file-based implementation. Adopt a library only if it demonstrably replaces code while preserving this format and refresh behavior; do not introduce a cache server or an additional persistent database.
-
-## 3. Eligibility and verification
-
-A dataset qualifies when at least one resource contains retrievable tabular data.
-
-- Exclude `NON_PUBLIC`, account/API-key requirements, documents, metadata-only responses, imagery and map layers.
-- Allow unspecified rights, missing distributions and simple licence acknowledgements.
-- Accept CSV/TSV, spreadsheets, statistical files and JSON/API observation tables.
-- Preserve licence terms without filtering for commercial permission.
-- Prefer streamed samples or bounded API requests. Inspect up to 100 observation rows.
-- Cap transferred and decompressed verification content at **32 MiB per resource**.
-- For binary formats requiring a complete file, download temporarily within that cap and inspect rows with an established reader.
-- Record format, column information, sampled row count, verification time, access method and outcome. Do not publish downloaded data or sample observations.
-- Classify oversized, unsupported or inconclusive resources as unresolved, then check other resources belonging to the dataset.
-- Retain previously verified datasets after transient failures with prior metadata and an unavailable status. Remove them when membership or eligibility explicitly ends.
-- Retry transient failures on the next run. Revisit stable unresolved outcomes after source changes or `--full`.
-
-Use standard-library CSV and JSON support where sufficient, spreadsheet readers for supported workbook formats and `pyreadstat` for statistical files. Keep HTTP transfers under the shared client’s limits.
-
-## 4. DuckDB tables and state
-
-Use explicit DuckDB schemas with `STRUCT` and list columns for repeated metadata. Read existing Parquet into temporary working tables, apply replacements with SQL, validate and export using `COPY ... FORMAT PARQUET` with Zstandard compression. DuckDB supports direct Parquet reading and writing. [DuckDB Parquet documentation](https://duckdb.org/docs/2.0/data/parquet/overview)
-
-| Table          | Primary identity         | Main columns                                                                                                                                                                                                                               |
-| -------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `datasets`     | Dataportalen dataset URI | Researchdata identifiers, multilingual titles/descriptions, publishers, subjects, languages, temporal/spatial descriptions, rights, licences, source URLs, resources, verification evidence, availability and additional source properties |
-| `dataportalen` | Dataportalen dataset URI | Registry entry URI, modification values, multilingual descriptive fields, identifiers, publishers, contacts, distributions, services and complete related metadata                                                                         |
-
-- Join both tables on the exact Dataportalen dataset URI.
-- Preserve multiple Researchdata associations as a list.
-- Preserve additional properties with source, entity/path, property, value, value type, language and datatype fields. Do not serialize the whole record into an opaque payload column.
-- Load previous rows, remove deleted or successfully replaced rows, and insert their replacements. Preserve prior rows when refreshing fails transiently.
-- Validate uniqueness, matching table membership, nested references and inventory outcomes before export.
-- Aim for exactly two Parquet files: `datasets.parquet` and `dataportalen.parquet`. Write each complete table with Zstandard compression and deterministic identity ordering before considering a split.
-- Split only a table whose measured compressed output is 100 MB or larger, and use the fewest parts needed to keep each file below that limit. Use consecutive identity ranges and names such as `datasets-001.parquet`; the other table remains a single file if it fits.
-- Do not create many small parts for incremental updates or parallel workers. In particular, a collection of approximately 20 MB parts is unacceptable when it could fit in fewer files. Merge parts back when a later output fits in fewer files, and remove superseded filenames from the candidate.
-- Preserve unchanged output files and avoid timestamp-only rewrites. Report each table's compressed size and file count, and explain any split in the sync report. Consumers discover the actual filenames through the manifest.
-- Publish both tables, inventory, RDF cache and manifest together. Keep temporary DuckDB working storage under the ignored work directory.
-
-## 5. Execution and publication
-
-Retain the local command:
+Use these configured endpoints:
 
 ```text
+Registry search:
+https://admin.dataportal.se/store/search
+
+Researchdata context:
+https://admin.dataportal.se/store/818
+
+Researchdata catalog metadata:
+https://admin.dataportal.se/store/818/metadata/9198
+
+Catalog identity:
+https://researchdata.se/catalogue/
+```
+
+Validate the catalog identity and type when loading catalog metadata. Do not silently continue against another context if configuration or upstream identifiers change.
+
+The registry returns search entries containing RDF/JSON metadata and separate registry information. Related managed entities may require additional lookups. [Dataportalen registry API](https://docs.dataportal.se/registry/api/)
+
+### 3.2 Candidate inventory query
+
+Send a GET request to the registry search endpoint with:
+
+```text
+type=solr
+limit=100
+offset=0
+sort=uri asc
+```
+
+Use this query, shown before HTTP URL encoding:
+
+```text
+public:true
+AND rdfType:http\://www.w3.org/ns/dcat#Dataset
+AND context:https\://admin.dataportal.se/store/818
+AND NOT metadata.predicate.uri.23fc4665:http\://publications.europa.eu/resource/authority/access-right/NON_PUBLIC
+```
+
+The access-right field is derived from:
+
+```text
+Predicate:
+http://purl.org/dc/terms/accessRights
+
+Solr field:
+metadata.predicate.uri.23fc4665
+```
+
+Keep predicate-field construction in one place. The suffix follows EntryStore’s truncated MD5 convention. Escape Solr values before passing request parameters to httpx; let httpx perform URL encoding.
+
+`public:true` concerns access to metadata. It does not establish that the dataset’s data is public. The separate access-right condition is necessary. [EntryStore search documentation](https://entrystore.org/kb/search/)
+
+This request was checked against the live service during planning. Do not hard-code the observed result counts.
+
+Do not add a distribution-existence filter. Missing distributions do not prevent explicitly linked repository resources from containing usable data.
+
+### 3.3 Pagination and inventory fields
+
+Page by increasing `offset`, with a maximum page size of 100 and stable `uri asc` ordering.
+
+For each candidate retain:
+
+- Exact dataset resource URI.
+- Registry entry URI.
+- Context ID and entry ID.
+- Metadata URL.
+- Registry modification value from the entry’s `info` graph.
+- Dataset-level modification values as separate descriptive metadata.
+- Access-right values.
+- Landing-page URLs.
+- Distribution references and their count.
+- Relevant identity assertions.
+- Source metadata already supplied by the search response.
+
+The registry modification value and the dataset’s descriptive `dct:modified` value are different fields. Compare the registry value with its previously stored registry value.
+
+Do not replace source change comparison with the local scrape timestamp.
+
+Validate page structure, ordering and duplicate identities. Detect repeated pages and inconsistent result totals. An inconsistent or incomplete required inventory fails the run without modifying published state.
+
+Search counts are a consistency signal, not sufficient proof of completeness. Reconcile against the catalog membership document.
+
+### 3.4 Explicit membership and removal confirmation
+
+Fetch:
+
+```http
+GET https://admin.dataportal.se/store/818/metadata/9198
+Accept: application/json
+```
+
+Read `dcat:dataset` membership from:
+
+```text
+https://researchdata.se/catalogue/
+```
+
+Use this small catalog document to distinguish an absent search result from a genuine membership removal.
+
+For a previously retained entry missing from the candidate search:
+
+1. Check whether its exact dataset URI remains in explicit catalog membership.
+2. If absent, mark it for removal.
+3. If still present, retrieve its current entry metadata and confirm whether its access rights now exclude it.
+4. If it is still a candidate but absent from search, treat the search inventory as inconsistent and block publication.
+
+For catalog members omitted from the candidate search, reconcile their exclusion rather than silently treating them as removed. Preserve previously confirmed exclusions when membership and the candidate query remain consistent; fetch unresolved differences.
+
+Do not use disappearance from a filtered query alone to delete data.
+
+### 3.5 Exact dataset and entity lookup
+
+For an exact dataset URI, use the candidate query plus:
+
+```text
+AND resource:<escaped-exact-dataset-uri>
+```
+
+For a previously known entry, prefer its known metadata URL:
+
+```http
+GET https://admin.dataportal.se/store/{contextId}/metadata/{entryId}
+Accept: application/json
+```
+
+For an unresolved related entity, use:
+
+```text
+public:true
+AND context:https\://admin.dataportal.se/store/818
+AND resource:<escaped-exact-entity-uri>
+```
+
+If the referenced entity is not managed in that context, perform an exact resource-URI lookup without the context restriction. Preserve provenance if multiple descriptions exist.
+
+Do not invent a generic `fields=` projection or assume that search responses contain full distribution, publisher or contact descriptions.
+
+Do not rely on `entry?...recursive=dcat&format=application/json` to return complete dataset metadata. The live check during planning returned entry information rather than the complete metadata graph for that JSON request. Use explicit metadata and related-entity retrieval.
+
+### 3.6 Change detection
+
+Schedule an entry when:
+
+- It is new.
+- Its registry modification value changed.
+- Its registry entry identity changed while the dataset URI remained stable.
+- Relevant identity or eligibility evidence changed.
+- Its previous processing outcome requires a transient retry.
+- Required persisted output is missing.
+- `--full` is selected.
+
+Use a canonical fingerprint of relevant source metadata already present in the inventory response to catch changed evidence without creating blank-node-driven differences.
+
+An unchanged record with a completed outcome remains untouched.
+
+Stable unresolved outcomes are retried after source change or `--full`. Transient failures are retried on the next normal run.
+
+A full run uses the same scoped Dataportalen inventory and refreshes every candidate. It does not scan the entire national catalog, enumerate Researchdata independently or traverse historical versions.
+
+## 4. Retrieval, identity resolution and semantic definitions
+
+### 4.1 Shared retrieval behavior
+
+Create one reusable asynchronous HTTP client per process.
+
+`runtime.py` owns:
+
+- Validated configuration.
+- Connection pooling.
+- Bounded concurrency.
+- Retry policy.
+- Timeouts and total request deadlines.
+- Response-size accounting.
+- Logging and request counters.
+
+Use Tenacity for retries rather than maintaining separate retry loops in each source module.
+
+Apply this behavior to semantic-cache requests too. The current cache calls an injected httpx client directly, so merely adding a helper used by other modules would leave cache requests outside the shared policy.
+
+Integrate the resolver with the runtime’s request operation through one explicit dependency. Preserve the existing simple resolver usage; do not access its private attributes or add a second HTTP client inside it.
+
+Default network settings:
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| Concurrency | 4 | Maximum simultaneous HTTP operations per process. |
+| Connect timeout | 10 seconds | Maximum connection-establishment wait. |
+| Read timeout | 30 seconds | Maximum period without response data. |
+| Attempts | 3 | Total attempts, including the initial request. |
+| Operation deadline | 90 seconds | Total request time, including retries and backoff. |
+| Verification rows | 100 | Maximum observation rows inspected per resource. |
+| Verification byte limit | 32 MiB | Maximum transferred and decompressed content per resource. |
+
+Retry connection failures, timeouts, HTTP 429 and transient server errors.
+
+Honor `Retry-After`, including HTTP-date values. If the requested delay cannot fit within the remaining deadline, record exhaustion instead of retrying early.
+
+Keep streaming transfers within the same deadlines and byte limits. A response that continuously trickles bytes must not evade the total deadline.
+
+### 4.2 Complete Dataportalen metadata
+
+The Dataportalen stage receives the inventory change list and its already-fetched root metadata.
+
+Retrieve dataset-owned related entities, including:
+
+- Distributions.
+- Publishers and creators.
+- Contact points.
+- Qualified attributions and their agents.
+- Data services.
+- Other explicitly linked descriptive entities required to retain the dataset’s metadata.
+
+Traverse included blank nodes completely. Follow managed metadata relations, not every URI appearing anywhere in the record.
+
+Do not crawl citations, previous versions, unrelated datasets or repository navigation.
+
+Share repeated entity lookups within the worker. Revalidate mutable cached entities once per run when requested.
+
+Preserve all source assertions, including unknown predicates and conflicting descriptions. Typed projections must not replace the complete property representation.
+
+Required Dataportalen retrieval failures prevent publication.
+
+### 4.3 Researchdata identities and metadata
+
+Use, in order:
+
+1. Explicit Researchdata landing-page links.
+2. Dataset access URLs and verified canonical redirects.
+3. Explicit dataset identity assertions.
+4. Previously confirmed associations whose supporting evidence remains valid.
+5. Explicit dataset links in descriptions when their context and target establish dataset identity.
+
+Do not match on title similarity or treat a cited publication DOI as a dataset identifier.
+
+Normalize DOI spelling and resolver forms for comparison while retaining original values. Preserve meaningful URL paths, query parameters and revision suffixes.
+
+Keep legitimate multiple associations. Record conflicting evidence as ambiguous.
+
+Use current landing-page structured metadata and targeted Researchdata metadata retrieval. The official service exposes OAI-PMH metadata and documents structured landing-page metadata. [Researchdata API](https://docs.researchdata.se/api/), [Researchdata JSON-LD](https://docs.researchdata.se/metadata/schema-org-json-ld/)
+
+For a resolved current OAI identifier, retrieve the current DataCite, DCAT and JSON-LD representations where advertised. Inspect explicitly advertised additional metadata representations when they contain attributes not covered by those sources.
+
+Do not reintroduce whole-catalog OAI listing or sitemap reconciliation.
+
+Do not synthesize older identifiers or fetch previous versions. Preserve version text found in current metadata as a source attribute only.
+
+If an entry points directly to an external repository and no Researchdata page can be established, retain that explicit outcome. Verified external data can still establish eligibility for an entry in Dataportalen’s Researchdata catalog.
+
+### 4.4 External metadata
+
+Keep external handling inside `researchdata.py`.
+
+Port useful handling for:
+
+- Zenodo.
+- KTH’s data repository.
+- ICOS.
+- SITES.
+- Generic structured dataset landing pages.
+
+Prefer repository JSON APIs when the advertised identity supports them. Use structured landing-page metadata as fallback.
+
+Retrieve additional metadata attributes as well as file URLs. Do not stop enrichment merely because one file was found.
+
+Follow dataset identity links, landing pages and explicitly linked metadata resources. Deduplicate URLs and stop cycles. Do not impose an arbitrary three-URL limit.
+
+Source-specific API discovery belongs in the source module. Semantic schema resolution must not execute arbitrary operations described by OpenAPI documents.
+
+For optional external failures:
+
+- Record the resource outcome and reason.
+- Retain prior metadata when available.
+- Mark retained metadata as stale.
+- Do not advance that resource’s successful-refresh evidence.
+- Continue other records.
+- Retry transient failures on the next run.
+
+Malformed optional external documents are explicit unresolved outcomes. Malformed required source metadata blocks publication.
+
+Unexpected programming errors must fail visibly with dataset context rather than being converted into ordinary external failures.
+
+### 4.5 Semantic resolver interface
+
+Retain one main normalization operation:
+
+```python
+async with SemanticResolver(cache_path, client, updates_path) as resolver:
+    result = await resolver.resolve(document, source_url=document_url)
+```
+
+Supported inputs remain:
+
+- RDF/JSON.
+- JSON-LD.
+- JSON Schema.
+- Schemas embedded in OpenAPI 3.x JSON documents.
+
+Use explicit format selection for schemas that cannot be recognized automatically, including boolean schemas without `$schema`.
+
+Retain the existing capabilities:
+
+- Expanded RDF predicates.
+- Languages and datatypes.
+- Named graphs.
+- Deterministic, source-scoped blank-node identities.
+- Unknown source properties.
+- Semantic definition outcomes.
+- JSON Schema references, anchors, relative identifiers and cycles.
+- Explicit unsupported outcomes for dynamic or recursive schema evaluation.
+- Original parsed JSON evidence for attributes not expressible as RDF.
+
+The resolver does not validate observation instances or execute OpenAPI requests.
+
+The output builder must preserve returned schema and source-JSON attributes in the typed property representation. Do not discard them because they do not appear in the normalized RDF statements.
+
+### 4.6 One compressed semantic cache
+
+Keep `data/current/rdf-cache.json.gz`.
+
+Use the existing standard-library JSON/gzip implementation. Do not replace it with Parquet, add a cache service or introduce a dedicated caching dependency.
+
+The cache stores:
+
+- Vocabulary definitions and labels.
+- JSON-LD contexts.
+- JSON Schema documents.
+- Shared mutable metadata entities.
+- Source and resolved URLs.
+- Available HTTP validators.
+- Availability and stale-data outcomes.
+
+Reuse vocabulary definitions during normal runs. Fetch missing definitions when encountered and refresh requested definitions during `--full`.
+
+Revalidate requested mutable entities independently with ETag or Last-Modified validators. Without validators, fetch and compare content.
+
+Use one worker-owned cache instance for semantic resolution and mutable-entity retrieval. Make that sharing explicit through the internal constructor/interface rather than reaching into private resolver state.
+
+Parallel jobs read the published cache without modifying it. Each emits its own update artifact.
+
+At build time:
+
+1. Load the published cache.
+2. Merge worker updates.
+3. Reject conflicting updates for the same cache key.
+4. Remove mutable entities no longer referenced by retained output.
+5. Retain vocabulary and schema definitions for reuse.
+6. Write sorted JSON with deterministic gzip headers.
+7. Include the resulting checksum in the manifest.
+
+Missing optional definitions must not discard original terms.
+
+A context required to interpret a document is different from an optional label definition. If required context resolution fails, that document has not been successfully normalized.
+
+Preserve successful work from other records when an optional document fails. Adapt the current resolver’s artifact lifecycle so a caught optional-document failure does not erase unrelated successful worker updates. Failed documents must not contribute partial successful results.
+
+## 5. Eligibility and bounded data verification
+
+### 5.1 Admission rule
+
+A new dataset enters the published tables only when at least one resource yields actual tabular observations.
+
+The following do not establish eligibility:
+
+- A `PUBLIC` label.
+- A filename ending in `.csv`.
+- A declared media type.
+- HTTP 200.
+- A metadata JSON document.
+- A table describing files or catalog entries.
+- An HTML page containing a download button.
+
+Verification must establish a tabular structure and at least one observation row.
+
+### 5.2 Supported data families
+
+Implement verification using the existing dependencies:
+
+| Data family | Verification |
+|---|---|
+| CSV and TSV | Parse a bounded stream with the standard-library CSV reader. Establish columns and observation rows. |
+| JSON data | Inspect a bounded response containing records or an explicitly described observation table. Do not count catalog metadata arrays as data. |
+| Observation APIs | Make a bounded request using source-advertised parameters or source-specific handling. Do not guess endpoints or required selectors. |
+| XLSX | Inspect a temporary bounded file with `openpyxl`. |
+| XLS | Inspect a temporary bounded file with `xlrd`. |
+| Statistical files | Use `pyreadstat` for the formats it supports, with bounded file acquisition and row inspection. |
+| Parquet | Use DuckDB to inspect a bounded complete file. Do not add PyArrow as a direct dependency. |
+
+Handle gzip-wrapped supported resources with bounded decompression.
+
+Do not build a general archive extraction system. Unsupported archives remain unresolved unless their repository exposes individual supported files.
+
+### 5.3 Limits and evidence
+
+Inspect at most 100 observation rows per resource.
+
+Limit both transferred bytes and decompressed verification content to 32 MiB per resource.
+
+For binary formats requiring a complete file:
+
+- Download into ignored temporary storage.
+- Stop when the byte limit is exceeded.
+- Inspect with the established format reader.
+- Remove the temporary file after verification.
+
+Do not extract untrusted filenames outside the work directory.
+
+Record:
+
+- Advertised and resolved URLs.
+- Source metadata URL.
+- Distribution identity when present.
+- Detected format and media type.
+- Column names and detected types.
+- Number of sampled rows.
+- Transferred and decompressed byte counts.
+- Access method.
+- Verification time.
+- Licence-acknowledgement URL when used.
+- Outcome and reason.
+
+Do not persist sampled values in output, cache artifacts or debug logs.
+
+A complete-file checksum may be verified when the whole bounded file is available. Do not claim checksum verification from a partial sample.
+
+### 5.4 Access and outcomes
+
+Follow ordinary redirects and simple anonymous licence acknowledgements. Do not automate registration, credentials, CAPTCHA, payment or access applications.
+
+Classify resources as verified, unavailable, excluded or unresolved, with a specific reason.
+
+Examples of unresolved outcomes include:
+
+- A supported format exceeds the verification limit.
+- The format is unsupported.
+- The endpoint needs selectors that cannot be established from metadata.
+- The response is inconclusive.
+- The resource cannot be reliably distinguished from metadata.
+
+Continue checking other resources belonging to the dataset.
+
+For dataset publication:
+
+- **Eligible:** At least one resource has successful verification.
+- **Unavailable:** A previously eligible dataset is retained with prior verification evidence after a current retrieval failure.
+- **Excluded:** Explicit membership or access/eligibility evidence ends its inclusion.
+- **Unresolved:** No resource has established eligibility, and the evidence does not justify exclusion.
+
+New unresolved datasets remain in the inventory only.
+
+Do not remove a previously verified dataset solely because one URL temporarily fails. Remove it when catalog membership ends or refreshed evidence explicitly establishes that it no longer qualifies.
+
+## 6. Tables, inventory and candidate construction
+
+### 6.1 Two typed tables
+
+Use the existing SQL definitions as the authoritative schema.
+
+Both tables use the exact Dataportalen dataset URI as their primary identity and contain the same dataset membership.
+
+| Table | Contents |
+|---|---|
+| `datasets` | Current Researchdata associations, enriched descriptive metadata, resources, verification evidence, availability, source outcomes and complete properties. |
+| `dataportalen` | Registry identity and modification values, complete dataset metadata, distributions, services, related entities and complete properties. |
+
+Shared descriptive projections include:
+
+- Identifiers.
+- Multilingual titles and descriptions.
+- Publishers, creators and contacts.
+- Subjects and keywords.
+- Languages.
+- Temporal and spatial descriptions.
+- Access rights, rights statements and licences.
+- Landing pages.
+- Issued and modified values.
+- Distributions and services.
+
+Use DuckDB `STRUCT` and list columns for repeated and nested data. Do not put the complete record in one opaque JSON column.
+
+Preserve additional properties using the existing fields:
+
+```text
+value
+value_type
+language
+datatype
+source_url
+entity_id
+graph_id
+property
+path
+```
+
+Retain original lexical values. Preserve JSON array ordering, empty containers, XML attributes, repeated elements and namespace-qualified names during conversion.
+
+Use JSON pointers or explicit namespace-expanded paths where necessary. No raw XML/RDF strings belong in the published tables.
+
+Keep source dates as source values even when they are partial or invalid. Operational timestamps use the declared timestamp types.
+
+### 6.2 Inventory state
+
+`inventory.json` replaces separate matching, checkpoint and run-history stores.
+
+For each current catalog identity retain the information needed for the next decision:
+
+- Dataset URI and registry entry identity.
+- Registry modification value.
+- Canonical source/identity fingerprint.
+- Eligibility and availability outcome.
+- Outcome reason.
+- Confirmed Researchdata associations and their evidence.
+- Ambiguous or unresolved identity evidence.
+- Whether a transient retry is required.
+- Relevant external-resource validators and current outcomes.
+- Reference information needed to retain cached mutable entities.
+
+Persist confirmed indirect associations here. Do not add a separate `matches.json`.
+
+Invalidate associations when membership or their supporting identity evidence changes.
+
+Do not maintain historical inventory entries for removed datasets. Report removals in the run report, then remove their current-state entries.
+
+### 6.3 Temporary artifacts
+
+Stage raw retrieved metadata and processed record results under `data/work/<run>/`.
+
+Artifacts contain:
+
+- Base Git commit.
+- Configuration and implementation fingerprints.
+- Scope and full/incremental settings.
+- Inventory/change list.
+- Source payloads needed for candidate construction.
+- Per-record processing outcomes.
+- Worker cache updates.
+- Request counters and timings.
+
+Keep these artifacts temporary. Do not publish raw-response archives.
+
+Write completed record results as processing proceeds so an interruption does not discard unrelated successful work.
+
+Reuse results only when their input identity/fingerprint, configuration and implementation revision still match. Use atomic artifact writes and reject incomplete artifacts.
+
+Actions artifacts expire after one day. Local work directories can be retained for diagnosis until explicitly cleaned.
+
+### 6.4 Building a candidate
+
+Use a temporary DuckDB connection and working storage inside the ignored work directory.
+
+Build as follows:
+
+1. Load and validate the existing manifest when a current generation exists.
+2. Create the declared tables from `schema.sql`.
+3. Insert existing Parquet rows into those declared tables so constraints are reapplied.
+4. Remove confirmed obsolete identities.
+5. Replace successfully refreshed records.
+6. Retain previous source values and verification evidence where the defined failure policy requires them.
+7. Merge cache updates and construct the next inventory.
+8. Validate the complete candidate.
+9. Export ordered Parquet files and supporting state.
+10. Write the manifest last.
+
+The builder must not publish half of a record pair. Every retained identity must exist in both tables.
+
+Source outcomes may differ within a dataset. Preserve provenance and stale status so old external metadata is not presented as freshly retrieved.
+
+### 6.5 Validation
+
+Before publication, check:
+
+- Primary-key uniqueness.
+- Identical dataset membership between both tables.
+- At least one successful verification record for every admitted dataset.
+- Consistency between availability and current verification outcomes.
+- Valid nested references and provenance.
+- Inventory outcomes consistent with table membership.
+- Cache references retained for unchanged records as well as refreshed ones.
+- Counts and checksums matching actual files.
+- No unsupported partial/scoped generation marked as complete.
+- No required-source failure hidden inside an otherwise completed artifact.
+
+Run the existing `publication_errors` view and reject any returned rows.
+
+Validation is an offline operation and must not fetch new source metadata.
+
+### 6.6 Parquet file count and size
+
+The target is exactly:
+
+```text
+datasets.parquet
+dataportalen.parquet
+```
+
+Write each complete table with DuckDB, Zstandard compression and stable dataset-URI ordering.
+
+**Keep one file per table whenever its measured size is below 100,000,000 bytes.**
+
+Only split a table whose complete compressed file reaches or exceeds that limit.
+
+For an oversized table:
+
+- Partition by consecutive dataset-URI ranges.
+- Start with the smallest candidate part count.
+- Divide rows approximately evenly.
+- Measure every written part.
+- Increase the part count only when a part still reaches the maximum.
+- Keep the first valid minimal part count from that procedure.
+- Use names such as `datasets_part_1.parquet`.
+- Merge back to fewer parts whenever a later generation permits it.
+
+Do not create parts for individual workers, incremental batches or small updates.
+
+Do not produce many approximately 20 MB files when the table fits in fewer files.
+
+The existing commit hook uses a 50 MB initial target for general file splitting. That target does not control the catalog builder. The builder must finish splitting and manifest generation before Git staging, leaving every published file below the hook’s 100 MB threshold.
+
+The hook does not update manifests. It must make no changes to an already validated catalog publication.
+
+### 6.7 Determinism and replacement
+
+Sort stable identities and unordered metadata collections deterministically.
+
+Use deterministic gzip serialization for the cache. Preserve existing output bytes when their logical contents are unchanged.
+
+Do not rewrite metadata solely to record that another identical fetch occurred. Put routine request timings and attempt information in the run report.
+
+Publish the tables, inventory, cache and manifest as one generation.
+
+For local replacement, validate a sibling candidate before swapping it into the destination. Recover an interrupted directory replacement automatically on the next invocation.
+
+Use an OS lock for concurrent local publication. A lock filename by itself does not prove that a process holds the lock.
+
+Do not recommend manual deletion of lock or replacement directories as routine recovery.
+
+## 7. CLI, configuration and diagnostics
+
+### 7.1 Commands
+
+Normal incremental execution:
+
+```sh
 uv run python -m scripts.sync
+```
+
+Explicit full refresh:
+
+```sh
 uv run python -m scripts.sync --full
 ```
 
-Keep `--config`, `--destination` and `--report`. Add stage selection for `inventory`, `dataportalen`, `researchdata` and `build`, with a shared work-directory argument so Actions invokes the same implementation.
+Scoped development run:
 
-### Scoped execution and diagnostics
+```sh
+uv run python -m scripts.sync \
+  --dataset-uri "<exact Dataportalen dataset URI>" \
+  --destination data/work/scoped-current \
+  --work-directory data/work/scoped-run \
+  --report data/work/scoped-report.json \
+  --log-level DEBUG
+```
 
-- Support repeatable `--dataset-uri` selectors and `--limit N` for a small, deterministic sample. Explicit URI selection retrieves only those entries; a limited run stops after collecting its sample rather than enumerating the full catalog.
-- Scoped runs must use an ignored destination, are marked as incomplete catalog coverage, cannot infer removals or advance production state, and cannot be published by `scripts.publish`.
-- Support `--log-level DEBUG`. INFO logs show stage progress, counts and elapsed time; DEBUG logs include dataset identity, source, operation, redacted URL, request attempt, status or exception class, elapsed time, retry delay, cache decision and parsing outcome. Log an unexpected exception with its traceback and dataset context, without logging credentials, response bodies or observation rows.
-- Set explicit configurable limits from the prototype onward: 10 seconds to connect, 30 seconds of read inactivity, at most three request attempts, and a 90-second total deadline per HTTP operation including retries. Respect `Retry-After`; if its delay exceeds the remaining deadline, record exhaustion instead of retrying early.
-- Handle expected network errors as outcomes at the dataset/resource level so one external failure does not discard unrelated completed work. Required-source failures still prevent publication; unexpected programming errors remain visible and must not be silently converted into successful outcomes.
-- Preserve completed record results in the existing temporary stage artifacts as work proceeds. Allow a rerun against the same work directory to reuse those results and retry failed or unfinished records when the input plan, configuration and implementation revision are unchanged. This is temporary artifact reuse, not a new persistent checkpoint database or run-history system.
-- After an interrupted run, rerun only the failing dataset or stage before attempting the full catalog again. The README must include copyable scoped, debug and stage-rerun commands.
+Deterministic small sample:
 
-### Workflow coordination
+```sh
+uv run python -m scripts.sync \
+  --limit 10 \
+  --destination data/work/sample-current \
+  --work-directory data/work/sample-run
+```
 
-Use five workflow files, with one coordinated harvest run. `harvest.yml` owns the schedule/manual trigger, run-level concurrency and job dependencies. The three stage workflows expose `workflow_call`; do not chain independently triggered runs through `workflow_run` or dispatch events.
+Stage execution:
 
-1. The inventory job records the base `main` commit, configuration, full/scoped settings and the shared change list in a run-specific artifact.
-2. The `fetch-dataportalen` and `fetch-researchdata` caller jobs both depend on inventory and invoke their respective reusable workflows in parallel. Both check out the recorded base commit and consume the same inventory artifact. Each writes a distinctly named result artifact, including its RDF-cache updates; neither modifies published data.
-3. The `publish` caller job depends on inventory and both fetch jobs through `needs`. It invokes `publish.yml` only after the required stages succeed and there are changes or refreshes to apply. Removal-only changes must still reach publication even if the fetch stages have no records to retrieve.
-4. `publish.yml` consumes those same-run artifacts, merges cache updates, builds and validates the complete candidate, and verifies the expected remote `main` head before creating the data-only commit. It cannot publish scoped runs or incomplete required-source results.
-5. `validate.yml` remains a separate code/catalog validation workflow for repository changes. Default tests exclude the commit-hook splitter tests; run those explicitly when the hook script changes.
+```sh
+uv run python -m scripts.sync --stage inventory --work-directory data/work/run
+uv run python -m scripts.sync --stage dataportalen --work-directory data/work/run
+uv run python -m scripts.sync --stage researchdata --work-directory data/work/run
+uv run python -m scripts.sync --stage build --work-directory data/work/run
+```
 
-Pass artifact names and the base commit through explicit workflow inputs and inventory outputs. Retain temporary artifacts for one day and skip downstream work when inventory finds no changes. Give fetch jobs read-only repository permissions; grant write permission only to the publication caller/job. Keep concurrency serialization at the coordinator level so reusable workflows do not contend for the same concurrency group.
+Offline catalog validation:
 
-The workflow files only orchestrate the existing Python stage commands; do not duplicate retrieval, validation or publication logic in YAML.
+```sh
+uv run python -m scripts.sync --stage validate --destination data/current
+```
 
-- Serialize harvest runs without cancelling an active run.
-- Block publication after required-source failures.
-- Record external failures under the retention policy.
-- Verify the original `main` head before publishing. If it advanced, stop and rerun against the newer checkout.
-- Commit only generated current data and state.
-- Verify action versions when implementing the workflow.
-- Keep `httpx`, Pydantic, useful parsing libraries and `tenacity`; use DuckDB for all Parquet operations and standard-library JSON/gzip for the RDF cache. Add no direct PyArrow dependency or adapter framework.
+Git publication:
 
-## 6. Required implementation order
+```sh
+uv run python -m scripts.publish \
+  --candidate data/work/run/candidate \
+  --expected-head "<base-main-commit>"
+```
 
-Follow these six steps in order. Retain old published data until final acceptance; do not run repeated full harvests or broad validation suites between small prototype edits.
+The default `sync` command runs the stages locally and safely replaces its destination. It does not commit or push.
 
-1. **Define and implement only the essential behavior tests.** Cover inventory eligibility and changes, metadata preservation, actual-data verification with its limits, and safe publication/failure retention, including the two-file default. Use a few end-to-end scenarios through module interfaces rather than tests for every helper or an extensive matrix. This work may be delegated to one subagent explicitly configured as `gpt-6.1-sol` with `reasoning_effort="high"` while the main agent proceeds with step 2; restrict the subagent to the agreed tests and do not create additional agents.
-2. **Build a working prototype.** Implement the shortest runnable path from a scoped live inventory through retrieval and verification to the two DuckDB-written Parquet tables. Concentrate on making that path work; run it and diagnose concrete failures, but defer intermediate linting, broad test suites, exhaustive validation and polishing. Include scope selectors, explicit network limits and basic error context immediately so prototype runs cannot waste a full-catalog run on one uncaught HTTP failure.
-3. **Deepen the working modules.** Use the `ask-matt` router's `codebase-design` skill and its `DEEPENING.md` guidance. Identify functionality that belongs together, place clear seams around it and hide its complexity behind small interfaces that provide substantial useful behavior. Keep source-specific logic local, remove pass-through wrappers and unnecessary abstractions, and let the coordinator call a few complete operations rather than orchestrating their internal steps. The proposed filenames may change, but do not exceed eight production Python files or twelve including tests; do not add extra architecture documents or a second implementation tree.
-4. **Adapt the existing essential tests to those interfaces.** Preserve behavioral assertions, replace obsolete tests and remove redundant internal tests instead of layering new ones on top. Add a test only for a concrete, essential correctness risk or reproduced bug not covered by the small suite. Run the focused suite after the structure settles and fix real failures; do not introduce additional review or validation phases without a demonstrated need.
-5. **Finish diagnostic logging.** Implement the INFO progress and DEBUG request/cache/parser/error context described above using standard logging in the existing modules. Make one failed dataset diagnosable from its identity and log trail, without introducing a logging framework, extra modules or permanent log archives.
-6. **Exercise scoped runs, then complete acceptance and cutover.** First demonstrate selected-record execution, a bounded HTTP failure, retained successful artifact results and a targeted rerun. Then run the required offline checks, one complete live candidate harvest and an unchanged incremental rerun. Verify representative live resources for supported formats, report any unverified support, classify omissions under the new scope, and validate publication through the workflow. Only after acceptance replace old outputs, remove obsolete code and update the README.
+Individual fetch stages write artifacts only. The individual build stage writes a candidate only.
 
-Remove full-catalog OAI enumeration, sitemap reconciliation, the general matching pipeline, old JSONL storage and redundant configuration. Preserve existing local downloads.
+`scripts.publish` is the separate operation that publishes a validated complete candidate to Git.
 
-Acceptance requires passing the minimal pytest suite, Ruff, formatting checks and complete DuckDB output validation; verified table joins and metadata fidelity; no duplicate growth; no publication after incomplete inventories or scoped runs; and a successful scheduled/manual workflow. Confirm that there are exactly two Parquet files whenever both tables fit below 100 MB individually. Report eligible, excluded, unresolved and unavailable counts with reasons, plus file counts and compressed sizes. Run these checks at the final acceptance point, repeating only checks affected by a subsequent fix. Commit implementation separately from generated data.
+### 7.2 Arguments and path rules
+
+Support:
+
+- `--config`.
+- `--destination`.
+- `--report`.
+- `--work-directory`.
+- `--full`.
+- `--stage`.
+- Repeatable `--dataset-uri`.
+- `--limit`.
+- `--log-level`.
+
+Use `--dataset-uri` and `--limit` as alternative scope selectors.
+
+Configured paths resolve relative to the selected TOML file. Explicit CLI paths resolve relative to the current working directory.
+
+`config.local.toml` is an ignored alternative selected with `--config`; do not add an implicit configuration-overlay system.
+
+An empty destination starts a fresh harvest. It does not automatically borrow current state from another destination.
+
+### 7.3 Scoped-run restrictions
+
+Explicit dataset selection retrieves only the selected entries.
+
+A limited run stops after collecting its deterministic sample. It must not enumerate the full catalog first.
+
+Scoped runs:
+
+- Must use an ignored destination.
+- Are marked as incomplete catalog coverage.
+- Cannot infer catalog-wide removals.
+- Cannot advance production state.
+- Cannot be published by `scripts.publish`.
+
+A selected record can reuse valid temporary results from the same scoped work directory.
+
+### 7.4 Configuration cleanup
+
+Retain only settings used by the new implementation.
+
+Remove sitemap and full-catalog OAI enumeration settings.
+
+Keep a targeted Researchdata OAI endpoint only for current-record retrieval. Remove the general SPARQL endpoint if no implemented operation uses it.
+
+Document units, defaults and valid ranges for all settings. Validate configuration before network work begins.
+
+Keep byte units explicit:
+
+- Verification limit uses MiB.
+- Git file limits and splitter settings use decimal MB.
+
+### 7.5 Logging and reports
+
+Use standard-library logging.
+
+INFO logs report stages, progress, counts and elapsed time.
+
+DEBUG logs include:
+
+- Dataset URI.
+- Source and operation.
+- Redacted URL.
+- Request attempt.
+- HTTP status or exception class.
+- Elapsed time and retry delay.
+- Cache reuse or refresh decision.
+- Parser and verification outcome.
+
+Do not log credentials, signed query values, response bodies or sampled observations.
+
+Unexpected exceptions include a traceback and dataset context.
+
+The JSON run report includes:
+
+- Full or scoped coverage.
+- Inventory, fetched and unchanged counts.
+- Eligible, excluded, unresolved and unavailable counts.
+- Reasons for exclusions and unresolved outcomes.
+- Confirmed and ambiguous associations.
+- Retried and retained-stale records.
+- Required and optional source failures.
+- Request attempts, including failures.
+- Stage and total elapsed time.
+- Table row counts, compressed sizes and file counts.
+- Publication or no-change outcome.
+
+Do not promise a sync duration before measuring a real run.
+
+## 8. GitHub Actions and publication
+
+### 8.1 Coordinator
+
+`harvest.yml` runs:
+
+- Daily at **03:17 UTC**.
+- Manually through `workflow_dispatch`, with a full-refresh option.
+
+Use one coordinator concurrency group with cancellation disabled.
+
+The coordinator records the base `main` commit and creates the inventory artifact.
+
+Both fetch workflows consume that same artifact and check out that same commit.
+
+### 8.2 Parallel fetch workflows
+
+`fetch-dataportalen.yml` and `fetch-researchdata.yml` expose `workflow_call`.
+
+Run them in parallel after inventory.
+
+Each workflow:
+
+- Uses read-only repository permissions.
+- Installs locked dependencies with uv.
+- Executes the corresponding Python stage.
+- Uploads distinctly named temporary artifacts.
+- Leaves tracked current data unchanged.
+- Retains diagnostic artifacts when a stage fails, without treating them as successful inputs.
+
+Do not coordinate independent runs through `workflow_run` or dispatch chains.
+
+### 8.3 Publication workflow
+
+`publish.yml` exposes `workflow_call`.
+
+The coordinator invokes it only after both fetch stages have completed successfully and there are changes to apply.
+
+Removal-only and inventory-state-only changes must still reach the build stage. Fetch stages can produce valid empty result artifacts in those cases.
+
+The publication workflow:
+
+1. Downloads the inventory and both same-run fetch artifacts.
+2. Verifies their base commit and fingerprints agree.
+3. Builds the candidate.
+4. Runs complete offline candidate validation.
+5. Confirms the run has full catalog coverage.
+6. Confirms no required-source failure occurred.
+7. Confirms remote `main` still equals the expected base commit.
+8. Stages only generated current data.
+9. Creates one data-only commit when content changed.
+10. Pushes without force.
+
+Check the expected remote head again immediately before publication. A normal push rejection also fails publication safely.
+
+If `main` advanced, stop. Update the checkout and rerun against the new state. Do not merge an old generated candidate over newer data.
+
+Require a clean index before staging generated output.
+
+Only the publication caller/job receives write permission. Fetch jobs do not receive it.
+
+Keep artifact retention at one day and use job-level timeouts. Use a 90-minute initial timeout for harvest stages and retain the existing 10-minute validation timeout.
+
+### 8.4 Validation workflow
+
+Retain the current offline checks:
+
+```sh
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+uv run pyright
+uv run python -m pytest
+```
+
+Add the offline catalog-validation command once published current files exist.
+
+Keep the push exclusion for routine generated-data commits. Do not exclude data paths from pull-request validation.
+
+Default pytest continues to exclude `test_split_data_files.py`.
+
+Run the hook tests explicitly after changing the splitter:
+
+```sh
+uv run python -m pytest tests/test_split_data_files.py
+```
+
+Use the `github-actions-latest` skill whenever workflow files are created or edited. Verify action versions at implementation time rather than copying stale version references into new workflows.
+
+## 9. Required implementation order
+
+Follow these six steps in order.
+
+### Step 1. Define the essential behavior tests
+
+Retain existing useful metadata, schema and cache coverage.
+
+Add a small number of end-to-end scenarios covering:
+
+- Inventory filtering and change detection.
+- Metadata preservation and identity evidence.
+- Actual-data verification and its limits.
+- Failure retention and safe publication.
+- The two-file default.
+
+Use public module operations as test entry points. Do not test every helper or add a large configuration matrix.
+
+This step may be assigned to one subagent explicitly configured as `gpt-6.1-sol` with `reasoning_effort="high"` while the main agent begins step 2. Limit that agent to the agreed tests.
+
+Keep four test files total, including the separate splitter test.
+
+### Step 2. Build the working prototype
+
+Implement the shortest complete path:
+
+```text
+Scoped Dataportalen inventory
+    → complete metadata retrieval
+    → Researchdata/external resolution
+    → bounded tabular verification
+    → two DuckDB-written Parquet tables
+```
+
+Use the implemented schema and semantic resolver.
+
+Include scope selectors, request deadlines, byte limits and dataset-level error context immediately.
+
+Run the scoped prototype and fix concrete failures. Defer broad linting, repeated full suites, exhaustive review and polishing until the path works.
+
+Measure requests and elapsed time in the prototype so subsequent decisions use evidence.
+
+### Step 3. Deepen the working modules
+
+Use the `codebase-design` skill and its `DEEPENING.md` guidance.
+
+Keep these complete operations behind small interfaces:
+
+- Runtime and bounded HTTP behavior.
+- Dataportalen inventory and complete metadata.
+- Researchdata/external resolution and verification.
+- Semantic normalization and cache handling.
+- Candidate construction and validation.
+
+Keep source-specific decisions local. Remove pass-through wrappers and duplicated state.
+
+The coordinator must not manage parser internals, cache keys, RDF traversal or SQL row construction.
+
+The proposed filenames can change if the prototype reveals a better grouping, but the final implementation must remain within eight production Python files and twelve total.
+
+Do not add another implementation tree or permanent architecture reports.
+
+### Step 4. Adapt and run the essential tests
+
+Update tests to use the settled interfaces.
+
+Preserve behavioral assertions. Replace obsolete tests instead of accumulating parallel old and new coverage.
+
+Add a test only for an essential correctness risk or a reproduced defect not already covered.
+
+The essential scenarios must demonstrate:
+
+- Complete pagination and failure on inconsistent inventory.
+- New, changed, unchanged, excluded and removed records.
+- Rejection of citation-based identity matches.
+- Legitimate multiple associations and ambiguity retention.
+- Preservation of languages, datatypes, repeated values and unknown properties.
+- Cache reuse, conditional refresh and worker-update merging.
+- Verification of observations rather than metadata.
+- Byte limits, interrupted responses and access restrictions.
+- Retention of prior successful data after optional external failure.
+- Rejection of publication after required-source failure.
+- Matching table membership and deterministic output.
+- Two Parquet files when both tables fit.
+- Rejection of scoped or outdated publication candidates.
+
+### Step 5. Finish diagnostic logging
+
+Complete the INFO and DEBUG behavior in the existing modules.
+
+Demonstrate that one failing dataset can be diagnosed using its identity, request attempts, parser outcome and final reason.
+
+Keep logs in the console and temporary run artifacts. Do not introduce a logging framework or permanent log archive.
+
+### Step 6. Complete acceptance and cutover
+
+First demonstrate:
+
+- An explicit selected-record run.
+- A deterministic limited run.
+- A bounded HTTP failure.
+- Preservation of other completed record artifacts.
+- A targeted rerun using the same work directory.
+- No production mutation from scoped execution.
+
+Then run:
+
+1. The required offline checks.
+2. One complete live candidate harvest.
+3. Complete candidate validation.
+4. An unchanged normal incremental rerun.
+5. A manual coordinated workflow that successfully publishes current data.
+
+Verify representative live resources for each claimed supported data family. Clearly distinguish fixture-tested support from formats actually exercised against live sources.
+
+Do not run repeated full harvests between small fixes. Repeat only checks affected by a subsequent change.
+
+## 10. Acceptance, cleanup and operating documentation
+
+### 10.1 Acceptance criteria
+
+The implementation is complete when:
+
+- All eligible current Dataportalen candidates have a documented outcome.
+- New published datasets have evidence of retrievable tabular observations.
+- Both Parquet tables have identical unique dataset identities.
+- Complete source properties and provenance survive normalization.
+- Confirmed associations are reused and invalidated correctly.
+- Optional external failures retain prior metadata with explicit stale outcomes.
+- Required-source failures leave the published generation unchanged.
+- Scoped runs cannot remove production records or publish.
+- Interrupted work can reuse valid completed temporary results.
+- An unchanged incremental run causes no duplicate growth or unnecessary source retrieval.
+- Output consists of exactly two Parquet files whenever each table fits below 100 MB.
+- Every published file remains below 100 MB.
+- The cache, inventory and manifest agree with the tables.
+- Ruff, formatting, mypy, Pyright and the default pytest suite pass.
+- A coordinated manual Actions run completes and publishes correctly.
+- Implementation changes and generated data are committed separately.
+
+Report actual counts, requests, runtime, compressed sizes and omissions by reason.
+
+Do not describe metadata completion as proof that every advertised resource is downloadable.
+
+### 10.2 Compare and preserve existing data
+
+Read the earlier manifest and files under `legacy/data/current/` for comparison.
+
+Compare:
+
+- Catalog identities.
+- Confirmed associations.
+- Retained metadata attributes.
+- Resource descriptions.
+- Previously available file evidence.
+- Outcomes under the new eligibility rules.
+
+The new scope intentionally excludes metadata-only and inaccessible datasets. Explain those differences by identity and reason rather than treating a reduced row count as automatic data loss.
+
+Do not blindly copy old eligibility conclusions. New table admission requires the defined verification evidence.
+
+Preserve `legacy/data/downloads/`, including its integrity manifest. Move it to `data/downloads/` only after checking destination conflicts and verifying copied/moved file integrity.
+
+Do not create another permanent migration command.
+
+### 10.3 Remove obsolete implementation after acceptance
+
+After successful cutover:
+
+- Remove obsolete code under `legacy/`.
+- Remove old JSONL generations after their retained information has been accounted for.
+- Remove full-catalog OAI enumeration and sitemap reconciliation.
+- Remove the general catalog-wide matching pipeline.
+- Remove obsolete SQLite, snapshot, run-history and persistent-checkpoint logic.
+- Remove unused configuration and dependencies.
+- Preserve downloaded research files.
+- Keep temporary diagnostic artifacts only while they are useful.
+
+Verify resolved deletion targets are inside the intended repository directories before recursive cleanup.
+
+### 10.4 Complete the README
+
+Replace the current placeholder with a self-contained operating guide covering:
+
+- What qualifies for publication.
+- What the two tables contain and how to join them.
+- Setup with `uv sync --locked`.
+- Incremental and full commands.
+- Scoped development commands.
+- Stage execution and artifact reuse.
+- Configuration defaults, ranges and path rules.
+- Semantic cache behavior.
+- Source and external failure policies.
+- Actual freshness guarantees.
+- Manifest-based output discovery.
+- DuckDB examples for reading both tables.
+- Schedule and manual Actions execution.
+- Publication prerequisites and remote-head conflicts.
+- Offline validation commands.
+- Splitter installation and its separate tests.
+- Dependency maintenance.
+- Troubleshooting request failures, incomplete inventories, stale metadata, locks and interrupted local replacement.
+- Links to the external API documentation used by the implementation.
+
+Keep changing catalog counts and lengthy dated acceptance narratives out of the README.
+
+The final repository must have one active execution path, two well-defined data tables, a reusable semantic cache, and enough diagnostics to resolve a failed record without restarting an unbounded full-catalog scrape.
