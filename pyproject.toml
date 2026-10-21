@@ -3,10 +3,20 @@ name = "researchdata-harvester"
 version = "0.1.0"
 description = "Independent Researchdata and Dataportalen metadata harvester"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.27", "pydantic>=2.9", "defusedxml>=0.7", "rdflib>=7"]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "defusedxml>=0.7",
+    "rdflib>=7",
+    "duckdb>=2.0.0",
+]
 
 [tool.uv]
 package = false
+
+[tool.parquet-hook]
+max_mb = 100
+target_mb = 50
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]

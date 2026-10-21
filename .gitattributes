@@ -1,1 +1,3 @@
 data/current/** -text
+*.parquet -text
+.githooks/* text eol=lf
