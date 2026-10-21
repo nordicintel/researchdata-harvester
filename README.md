@@ -52,3 +52,40 @@ Git does not enable repository hooks automatically after cloning. Run the
 installation command in each checkout, including CI checkouts that should use
 the hook. The existing published-data builder remains responsible for producing
 consistent filenames and manifests.
+
+
+## Semantic definitions
+
+`harvester/vocabulary.py` exposes one resolver for RDF/JSON, JSON-LD, JSON
+Schema and schemas embedded in OpenAPI 3.x JSON documents:
+
+```python
+from pathlib import Path
+import httpx
+from harvester.vocabulary import SemanticResolver
+
+async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with SemanticResolver(
+        Path("data/rdf-cache.json.gz"),
+        client,
+        Path("data/work/semantic-updates.json.gz"),
+    ) as resolver:
+        result = await resolver.resolve(document, source_url=document_url)
+```
+
+Run this within an async function. Pass `format="json-schema"` for schemas
+without `$schema`, including boolean schemas. RDF results contain normalized
+properties and semantic definitions; schema results contain complete `schemas`
+and `schema_references` with resolution outcomes. Original input is preserved.
+Static references support JSON Pointers, anchors, relative identifiers and cycles.
+Dynamic/recursive references are retained with an explicit unsupported outcome;
+this module does not validate data instances. OpenAPI support collects component
+and inline schemas, not API operations or referenced response/request documents.
+Examples, citations and arbitrary URLs do not trigger retrieval.
+
+The gzip JSON cache also stores non-RDF definitions; its existing filename can
+stay unchanged. Successful context exit saves only worker updates, leaving the
+published cache untouched. The build stage merges those updates using `RdfCache`
+as documented at the top of the module. Failed resolution does not publish an
+update artifact. These are internal building blocks; the redesigned workflows
+have not yet been wired to them.
