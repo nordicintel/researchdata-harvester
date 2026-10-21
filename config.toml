@@ -1,0 +1,18 @@
+# Paths resolve relative to this configuration file, independently of cwd.
+database = "data/catalog.sqlite"
+export_directory = "data/exports"
+download_directory = "data/downloads"
+formats = ["datacite", "dcat", "json_ld"]
+oai_url = "https://api.researchdata.se/oai-pmh"
+sitemap_url = "https://researchdata.se/catalogue/sitemap.xml"
+sparql_url = "https://admin.dataportal.se/sparql"
+# Use "all" only for an explicit global Dataportalen audit.
+dataportalen_scope = "researchdata"
+catalog_metadata_url = "https://admin.dataportal.se/store/818/metadata/9198"
+catalog_uri = "https://researchdata.se/catalogue/"
+timeout = 90
+concurrency = 4
+retries = 5
+sparql_page_size = 500
+identity_batch_size = 100
+landing_fallback = true
