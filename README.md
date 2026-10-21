@@ -10,7 +10,7 @@ Install the locked dependencies and enable the hook once per checkout:
 
 ```sh
 uv sync --locked
-uv run python -m scripts.parquet_hook --install
+uv run python -m scripts.split_data_files --install
 ```
 
 Commit normally. The hook replaces staged `.parquet`, `.jsonl`, `.parquet.gz`
@@ -18,7 +18,7 @@ and `.jsonl.gz` files of 100 MB or larger, then stages the replacements
 automatically. Smaller files stay unchanged. Part numbers precede the complete
 suffix, for example `name_part_1.parquet.gz` or `name_part_2.jsonl`.
 
-Configure `[tool.parquet-hook]` in `pyproject.toml`. `max_mb = 100` is the
+Configure `[tool.split-data-files]` in `pyproject.toml`. `max_mb = 100` is the
 threshold and final maximum; `target_mb = 50` is only an initial size estimate.
 MB means 1,000,000 bytes. The initial part count is the original byte size
 divided by the target, rounded up, and rows are divided as evenly as possible.
@@ -41,7 +41,7 @@ files that reference filenames, such as manifests, are not rewritten by this hoo
 For a manual run or smaller development thresholds:
 
 ```sh
-uv run python -m scripts.parquet_hook --max-mb 1 --target-mb 0.5
+uv run python -m scripts.split_data_files --max-mb 1 --target-mb 0.5
 ```
 
 Git does not enable repository hooks automatically after cloning. Run the

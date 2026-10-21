@@ -13,7 +13,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from scripts.parquet_hook import split_file
+from scripts.split_data_files import split_file
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -42,7 +42,7 @@ def repository(tmp_path: Path) -> Path:
         "uv.lock",
         ".gitattributes",
         ".githooks/pre-commit",
-        "scripts/parquet_hook.py",
+        "scripts/split_data_files.py",
     ):
         destination = tmp_path / name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +106,7 @@ def test_commit_splits_rows_without_staging_unrelated_edits(
     git(repository, "add", source.name, "small.parquet")
     (repository / "local.txt").write_text("Do not commit this")
     result = git(repository, "commit", "-m", "Split a dataset")
-    assert "parquet-hook:" in result.stderr + result.stdout
+    assert "split-data-files:" in result.stderr + result.stdout
     parts = sorted(
         repository.glob(f"sample data_part_*{suffix}"),
         key=lambda p: int(p.name.rsplit("_", 1)[1].split(".")[0]),
@@ -178,7 +178,7 @@ def test_failed_commit_preserves_index_and_files(
     index = git(repository, "write-tree").stdout
     result = git(repository, "commit", "-qm", "Must fail", check=False)
     assert result.returncode != 0
-    assert "parquet-hook:" in result.stderr
+    assert "split-data-files:" in result.stderr
     assert git(repository, "write-tree").stdout == index
     assert source.read_bytes() == before
     parts = list(repository.glob("data_part_*.parquet"))

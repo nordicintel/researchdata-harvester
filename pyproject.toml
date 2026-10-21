@@ -14,7 +14,7 @@ dependencies = [
 [tool.uv]
 package = false
 
-[tool.parquet-hook]
+[tool.split-data-files]
 max_mb = 100
 target_mb = 50
 

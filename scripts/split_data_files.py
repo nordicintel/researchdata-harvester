@@ -1,6 +1,85 @@
 # SPDX-License-Identifier: NOASSERTION
 # Copyright (c) 2026 NordicIntel
-"""Split staged Parquet/JSONL files, including gzip wrappers, before committing."""
+"""Split oversized staged data files into smaller parts before a Git commit.
+
+Supported formats are .parquet, .jsonl, .parquet.gz and .jsonl.gz (case
+insensitive). This script processes staged additions and modifications, replaces
+oversized originals in the working tree, and stages their replacement parts.
+Unrelated files are not staged. Smaller files are left unchanged.
+
+Setup in this or another repository:
+    1. Put this file at scripts/split_data_files.py in the repository root.
+       Use Python 3.12+, Git and uv; add DuckDB with ``uv add duckdb`` and commit
+       pyproject.toml and uv.lock. No imports from the harvester are required.
+    2. Create .githooks/pre-commit at the repository root, containing exactly:
+
+           #!/bin/sh
+           exec uv run --locked python -m scripts.split_data_files
+
+       Save it with LF line endings. Add these rules to .gitattributes so Git
+       preserves data bytes and the shell hook's line endings:
+
+           *.parquet -text
+           *.jsonl -text
+           *.gz -text
+           .githooks/* text eol=lf
+
+    3. From the repository root, run:
+
+           uv sync --locked
+           uv run python -m scripts.split_data_files --install
+           git add .githooks/pre-commit
+           git update-index --chmod=+x .githooks/pre-commit
+
+       Commit the script, hook, attributes and dependency files. --install enables
+       core.hooksPath=.githooks locally; it does not create the hook file. Each
+       clone must run --install separately. Existing alternative hooks are
+       rejected: integrate the command into your existing pre-commit hook instead
+       of replacing it (stop that hook if this command fails).
+
+Configuration and manual execution:
+    Optional defaults in the root pyproject.toml:
+
+        [tool.split-data-files]
+        max_mb = 100
+        target_mb = 50
+
+    MB means 1,000,000 bytes; require 0 < target_mb < max_mb. CLI arguments
+    override these defaults, for example:
+
+        uv run python -m scripts.split_data_files --max-mb 1 --target-mb 0.5
+
+    Manual execution also modifies staged files; it is not a dry run. Commit
+    normally after installation; a failure blocks the commit with a diagnostic.
+
+Splitting behavior:
+    Files at or above max_mb are split. The initial part count is the original
+    on-disk size divided by target_mb, rounded up (at least two parts, at most
+    one per row). Rows are divided evenly. If any output still reaches max_mb,
+    retry with more parts. Only the maximum is enforced: parts may exceed the
+    target. An oversized single row cannot be split and causes failure.
+
+    Parts stay beside the original, named name_part_1.parquet, name_part_2.jsonl.gz,
+    etc., preserving the complete suffix. DuckDB rewrites Parquet with internal
+    ZSTD compression; Parquet file bytes and custom metadata are not preserved.
+    JSONL is split on binary lines without parsing or changing their bytes.
+    Outer .gz wrappers are unpacked temporarily and recreated with deterministic
+    gzip headers. Gzip thresholds apply to compressed sizes, not unpacked sizes.
+
+Safety and limits:
+    Oversized staged and working copies must match; stage or stash edits first.
+    Symlinks and existing/tracked part-name collisions are rejected. All parts
+    are prepared and checked in temporary storage before replacing originals;
+    source and index hashes are checked again before replacement. Ordinary
+    replacement/staging errors restore originals and remove created parts; this
+    is not crash-atomic recovery. Allow temporary disk space for source copies,
+    decompressed inputs and output parts. Avoid concurrent edits while splitting.
+
+    The hook updates neither manifests nor references to old filenames. Data
+    publishers must maintain those themselves. It does not check historical Git
+    blobs, unsupported formats or already committed files, and does not upload
+    data. Consumers must read numbered parts in numeric order when order matters.
+"""
 
 import argparse
 import gzip
@@ -138,7 +217,7 @@ def split_staged(root: Path, maximum: int, target: int) -> int:
 
     if not candidates:
         return 0
-    with tempfile.TemporaryDirectory(prefix="parquet-hook-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="split-data-files-") as temporary:
         prepared = []
         for index, (name, oid) in enumerate(candidates):
             directory = Path(temporary) / str(index)
@@ -208,14 +287,16 @@ def split_staged(root: Path, maximum: int, target: int) -> int:
                 f"{part.stat().st_size / 1_000_000:.2f} MB" for part in parts
             )
             print(
-                f"parquet-hook: {source.relative_to(root)} -> {len(parts)} parts ({sizes})"
+                f"split-data-files: {source.relative_to(root)} -> {len(parts)} parts ({sizes})"
             )
     return len(candidates)
 
 
 def main() -> int:
     """Read project defaults, optionally install the hook, or process the index."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--install", action="store_true", help="Enable .githooks locally"
     )
@@ -254,10 +335,10 @@ def main() -> int:
             hook = root / ".githooks" / "pre-commit"
             hook.chmod(hook.stat().st_mode | 0o111)
             git(root, "config", "--local", "core.hooksPath", ".githooks")
-            print("parquet-hook: enabled .githooks/pre-commit for this checkout")
+            print("split-data-files: enabled .githooks/pre-commit for this checkout")
             return 0
         with (root / "pyproject.toml").open("rb") as stream:
-            settings = tomllib.load(stream).get("tool", {}).get("parquet-hook", {})
+            settings = tomllib.load(stream).get("tool", {}).get("split-data-files", {})
         maximum = (
             args.max_mb if args.max_mb is not None else settings.get("max_mb", 100)
         )
@@ -282,7 +363,7 @@ def main() -> int:
         zlib.error,
         duckdb.Error,
     ) as error:
-        print(f"parquet-hook: {error}", file=sys.stderr)
+        print(f"split-data-files: {error}", file=sys.stderr)
         return 1
 
 
