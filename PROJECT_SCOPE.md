@@ -39,6 +39,7 @@ Target repository: `nordicintel/researchdata-harvester`, public. The public-repo
 - Reprocessing after failure must be idempotent. Retrying a run must not duplicate records or links.
 - Keep persistence and maintenance minimal. There is no requirement to resume at an exact page, preserve per-page checkpoints, store every past run, or maintain a general workflow recovery framework.
 - Retain ordinary request timeouts, bounded concurrency, transient-error retries and handling of server retry instructions.
+- Required Researchdata and Dataportalen failures block publication. External enrichment failures are recorded as unavailable and do not block publication; retain last-known metadata for the same current dataset as stale and mark its derived files unverified until recovery.
 
 ### 4. GitHub-hosted operation and publication
 

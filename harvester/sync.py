@@ -60,6 +60,7 @@ async def sync(
         dataportalen = load_records(current, "dataportalen")
         previous_links = list(load_records(current, "links").values())
         previous_external = list(load_records(current, "external").values())
+        previous_files = list(load_records(current, "files").values())
         transport = Transport(config, client)
         try:
             progress(
@@ -85,7 +86,12 @@ async def sync(
             )
             progress("Resolving and revalidating dataset-owned external metadata")
             external, files = await enrich_records(
-                transport, research, dataportalen, links, previous_external
+                transport,
+                research,
+                dataportalen,
+                links,
+                previous_external,
+                previous_files,
             )
             state = {"boundary": boundary, "fingerprints": fingerprints}
             collections = {

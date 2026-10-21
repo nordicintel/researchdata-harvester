@@ -12,11 +12,14 @@ from collections.abc import Iterator
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
+from xml.sax import SAXException
 
 import httpx
 import rdflib
+from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring
 from rdflib import BNode, Graph, Literal
+from rdflib.exceptions import ParserError
 
 from harvester.dataportalen import triples_to_metadata
 from harvester.metadata import (
@@ -234,16 +237,22 @@ def _file_metadata(document: Any, anchors: set[str] | None = None) -> list[dict]
                 "raw": node,
             }
         repository_files = node.get("files")
-        entries = (
-            repository_files
-            if isinstance(repository_files, list)
-            else (
-                repository_files.get("entries", {}).values()
-                if isinstance(repository_files, dict)
-                else []
-            )
-        )
+        if isinstance(repository_files, dict):
+            entries = repository_files.get("entries", {})
+            if not isinstance(entries, dict):
+                raise ValueError("Repository file entries must be an object.")
+            entries = list(entries.values())
+        elif isinstance(repository_files, list):
+            entries = repository_files
+        else:
+            entries = []
         for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("links", {}), dict
+            ):
+                raise ValueError(
+                    "Repository files must contain objects with link objects."
+                )
             links = entry.get("links", {})
             url = _url(links.get("content", links.get("self")))
             if url:
@@ -403,19 +412,22 @@ async def enrich_records(
     dataportalen: dict,
     links: list,
     previous: list[dict],
+    previous_files: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Revalidate each linked metadata resource and retain its complete parsed payload.
 
-    Permanent access failures are explicit outcomes. Retryable network and source
-    failures propagate so callers cannot commit a falsely complete harvest.
+    External failures retain last-known metadata as stale. Required catalog
+    inventories and representations are validated separately by the coordinator.
     """
     previous_by_url = {entry["url"]: entry for entry in previous}
     owners: dict[str, set[str]] = {}
     files: dict[tuple[str, str], dict] = {}
     tasks: dict[str, asyncio.Task] = {}
 
-    def add_files(identifier: str, entries: list[dict]) -> None:
+    def add_files(identifier: str, entries: list[dict], *, stale: bool = False) -> None:
         for entry in entries:
+            if stale and (identifier, entry["url"]) in files:
+                continue
             old_metadata = files.get((identifier, entry["url"]), {}).get("metadata", {})
             files[(identifier, entry["url"])] = {
                 "identifier": identifier,
@@ -424,7 +436,7 @@ async def enrich_records(
                     old_metadata
                     | {key: value for key, value in entry.items() if value is not None}
                 ),
-                "status": "discovered",
+                "status": "unverified" if stale else "discovered",
             }
 
     for identifier, record in research.items():
@@ -460,6 +472,48 @@ async def enrich_records(
         for url in urls:
             owners.setdefault(url, set()).add(identifier)
 
+    def unavailable(url: str, error: str, **details: Any) -> dict:
+        old = previous_by_url.get(url, {})
+        payload_owners = set(
+            old.get("metadata_identifiers", old.get("identifiers", []))
+        )
+        if payload_owners and not payload_owners & owners[url]:
+            old = {}
+        entry = copy.deepcopy(old)
+        entry.update(url=url, status="unavailable", error=error, **details)
+        entry.setdefault("metadata", None)
+        entry.setdefault("validators", {})
+        entry.setdefault("related_metadata", [])
+        parsed = urlsplit(url)
+        if parsed.hostname in {"zenodo.org", "datarepository.kth.se"} and re.fullmatch(
+            r"/api/records/[\w-]+", parsed.path
+        ):
+            entry["related_metadata"] = sorted(
+                set(
+                    entry["related_metadata"]
+                    + [url.replace("/api/records/", "/records/", 1)]
+                )
+            )
+        entry["metadata_stale"] = entry["metadata"] is not None
+        if entry["metadata_stale"]:
+            entry["metadata_identifiers"] = sorted(payload_owners & owners[url])
+        else:
+            entry.pop("metadata_identifiers", None)
+        return entry
+
+    def recovered(old: dict) -> dict:
+        entry = copy.deepcopy(old)
+        entry["status"] = "available"
+        for key in (
+            "error",
+            "metadata_stale",
+            "metadata_identifiers",
+            "http_status",
+            "response_metadata",
+        ):
+            entry.pop(key, None)
+        return entry
+
     async def fetch(url: str) -> tuple[dict, list[str]]:
         old = previous_by_url.get(url, {})
         validators = old.get("validators", {})
@@ -470,56 +524,42 @@ async def enrich_records(
             headers["If-None-Match"] = validators["etag"]
         if validators.get("last_modified"):
             headers["If-Modified-Since"] = validators["last_modified"]
-        try:
-            response = await transport.request(
-                "GET",
-                url,
-                headers=headers,
-                allowed_statuses={304, *PERMANENT},
-                metadata_only=True,
-            )
-        except httpx.TransportError as error:
-            raise RuntimeError(
-                f"External metadata request failed for {url}: {error}"
-            ) from error
+        response = await transport.request(
+            "GET",
+            url,
+            headers=headers,
+            allowed_statuses={304, *PERMANENT},
+            metadata_only=True,
+        )
         if response.status_code == 304:
-            if not old or old.get("status") != "available":
+            if old.get("metadata") is None:
                 raise ValueError(
                     f"Received HTTP 304 without reusable metadata for {url}."
                 )
-            return copy.deepcopy(old), list(old.get("related_metadata", []))
+            return recovered(old), list(old.get("related_metadata", []))
         if response.status_code in PERMANENT:
-            parsed = urlsplit(url)
-            fallback = []
-            if parsed.hostname in {
-                "zenodo.org",
-                "datarepository.kth.se",
-            } and re.fullmatch(r"/api/records/[\w-]+", parsed.path):
-                fallback = [url.replace("/api/records/", "/records/", 1)]
-            return {
-                "url": url,
-                "final_url": str(response.url),
-                "status": "restricted"
-                if response.status_code in {401, 403}
-                else "unavailable",
-                "http_status": response.status_code,
-                "metadata": None,
-                "validators": {},
-                "related_metadata": fallback,
-            }, fallback
+            entry = unavailable(
+                url,
+                f"HTTP {response.status_code}",
+                final_url=str(response.url),
+                http_status=response.status_code,
+            )
+            if response.status_code in {401, 403}:
+                entry["status"] = "restricted"
+            return entry, entry["related_metadata"]
         response.raise_for_status()
         if response.extensions.get("metadata_body_skipped"):
-            return {
-                "url": url,
-                "final_url": str(response.url),
-                "status": "unsupported",
-                "metadata": {
-                    "content_type": response.headers.get("content-type"),
-                    "content_length": response.headers.get("content-length"),
-                },
-                "validators": {},
-                "metadata_status": "not_a_metadata_response",
-            }, []
+            entry = unavailable(
+                url,
+                "Response is not a supported metadata format",
+                final_url=str(response.url),
+            )
+            entry["status"] = "unsupported"
+            entry["response_metadata"] = {
+                "content_type": response.headers.get("content-type"),
+                "content_length": response.headers.get("content-length"),
+            }
+            return entry, entry["related_metadata"]
         if urlsplit(str(response.url)).hostname in OWN_HOSTS:
             return {
                 "url": url,
@@ -529,11 +569,24 @@ async def enrich_records(
                 "validators": {},
             }, []
         digest = hashlib.sha256(response.content).hexdigest()
-        if old.get("sha256") == digest and old.get("status") == "available":
-            return copy.deepcopy(old), list(old.get("related_metadata", []))
+        if old.get("sha256") == digest and old.get("metadata") is not None:
+            return recovered(old), list(old.get("related_metadata", []))
         try:
             metadata, related = _parse_response(response)
-        except ValueError as error:
+            _file_metadata(
+                metadata,
+                {normalize_identity(url), normalize_identity(str(response.url))},
+            )
+        except (
+            ValueError,
+            SyntaxError,
+            TypeError,
+            AttributeError,
+            KeyError,
+            SAXException,
+            ParserError,
+            DefusedXmlException,
+        ) as error:
             raise ValueError(
                 f"Invalid metadata from {response.url}: {error}"
             ) from error
@@ -573,7 +626,20 @@ async def enrich_records(
 
     async def retrieve(url: str) -> tuple[dict, list[str]]:
         nonlocal completed
-        result = await fetch(url)
+        try:
+            result = await fetch(url)
+        except (httpx.HTTPError, ValueError) as error:
+            details = {}
+            if isinstance(error, httpx.HTTPStatusError):
+                details = {
+                    "http_status": error.response.status_code,
+                    "final_url": str(error.response.url),
+                }
+            entry = unavailable(url, str(error) or type(error).__name__, **details)
+            logging.getLogger(__name__).warning(
+                "External metadata unavailable: %s (%s)", url, entry["error"]
+            )
+            result = entry, entry["related_metadata"]
         completed += 1
         if completed == 1 or completed % 100 == 0:
             logging.getLogger(__name__).info(
@@ -604,19 +670,54 @@ async def enrich_records(
                 before = len(owners[target])
                 owners[target].update(owners[url])
                 changed |= len(owners[target]) != before
+
+    def resource_files(url: str, entry: dict) -> list[tuple[str, list[dict]]]:
+        extracted = []
+        for identifier in sorted(owners[url]):
+            if entry["status"] != "available" and identifier not in entry.get(
+                "metadata_identifiers", []
+            ):
+                continue
+            anchors = {
+                normalize_identity(value)
+                for value in (url, entry.get("final_url", url))
+            } | {
+                item["normalized"]
+                for item in research[identifier].get("identities", [])
+                if item.get("relation") == "version" and item.get("normalized")
+            }
+            extracted.append((identifier, _file_metadata(entry["metadata"], anchors)))
+        return extracted
+
     for url, entry in external.items():
+        extracted = []
+        if entry.get("metadata") is not None:
+            try:
+                extracted = resource_files(url, entry)
+            except (ValueError, TypeError, AttributeError, KeyError) as error:
+                entry = unavailable(url, f"Invalid file metadata: {error}")
+                external[url] = entry
+                if entry.get("metadata") is not None:
+                    try:
+                        extracted = resource_files(url, entry)
+                    except (ValueError, TypeError, AttributeError, KeyError):
+                        extracted = []
         entry["identifiers"] = sorted(owners[url])
-        if entry["status"] == "available":
-            for identifier in entry["identifiers"]:
-                anchors = {
-                    normalize_identity(value)
-                    for value in (url, entry.get("final_url", url))
-                } | {
-                    item["normalized"]
-                    for item in research[identifier].get("identities", [])
-                    if item.get("relation") == "version" and item.get("normalized")
-                }
-                add_files(identifier, _file_metadata(entry["metadata"], anchors))
+        for identifier, entries in extracted:
+            add_files(identifier, entries, stale=entry["status"] != "available")
+    for old_file in previous_files or []:
+        landing = old_file.get("metadata", {}).get("landing_url")
+        resource = external.get(_resource_url(landing)) if landing else None
+        if (
+            resource
+            and resource["status"] != "available"
+            and old_file["identifier"] in resource["identifiers"]
+        ):
+            add_files(
+                old_file["identifier"],
+                [old_file["metadata"] | {"url": old_file["url"]}],
+                stale=True,
+            )
     return [external[url] for url in sorted(external)], [
         files[key] for key in sorted(files)
     ]

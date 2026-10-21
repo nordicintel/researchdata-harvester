@@ -5,6 +5,7 @@
 import importlib
 import json
 
+import httpx
 import pytest
 
 from harvester.config import Config
@@ -92,3 +93,35 @@ async def test_interrupted_enrichment_keeps_all_published_bytes(tmp_path, monkey
             Config(current_directory=current), progress=lambda message: None
         )
     assert {path.name: file_hash(path) for path in current.iterdir()} == before
+
+
+async def test_external_http_failure_publishes_outcome_and_advances_boundary(
+    tmp_path, monkeypatch
+):
+    current = tmp_path / "current"
+    initial(current)
+    url = "https://example.org/current"
+
+    async def research(*args, **kwargs):
+        result = records("new")
+        result["new"]["identities"] = [{"value": url, "relation": "version"}]
+        return result, {}
+
+    async def dataportalen(*args):
+        return {}, {"members": []}
+
+    monkeypatch.setattr(coordinator, "harvest_researchdata", research)
+    monkeypatch.setattr(coordinator, "harvest_dataportalen", dataportalen)
+    monkeypatch.setattr(coordinator, "match_records", lambda *args: ([], {}, {}))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(500))
+    ) as client:
+        result = await coordinator.sync(
+            Config(current_directory=current, retries=0),
+            client=client,
+            progress=lambda message: None,
+        )
+    assert result["status"] == "complete"
+    assert result["external_outcomes"] == {"unavailable": 1}
+    assert set(load_records(current, "researchdata")) == {"new"}
+    assert json.loads((current / "state.json").read_text())["boundary"] != "2026-10-20"

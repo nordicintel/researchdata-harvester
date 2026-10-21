@@ -47,7 +47,7 @@ External enrichment runs automatically for dataset-owned resources. Zenodo and K
 
 The harvester keeps restricted datasets and records unavailable metadata explicitly. File discovery does not establish download rights, tabular usability or redistribution permission. Normal harvesting does not download underlying research files.
 
-A failed inventory, malformed required response or exhausted transient retry leaves the published current directory and successful boundary unchanged. Continuation tokens live only in memory. Local writers use an OS lock; directory replacement retains the previous directory only while the swap completes. A later invocation recovers an interrupted swap.
+A failed required catalog inventory, malformed required catalog response or exhausted catalog retry leaves the published current directory and successful boundary unchanged. External network failures and malformed external metadata are recorded as unavailable after retries. Last-known metadata for the same current dataset is retained and marked stale; derived files are marked unverified. These outcomes do not block publication. Continuation tokens live only in memory. Local writers use an OS lock; directory replacement retains the previous directory only while the swap completes. A later invocation recovers an interrupted swap.
 
 ## GitHub operation
 
@@ -67,9 +67,9 @@ Default tests are offline. Live acceptance is a separate full harvest and subseq
 
 ### Verification status on 21 October 2026
 
-The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 77 offline tests pass, including publication against a real local Git remote.
+The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 85 offline tests pass, including publication against a real local Git remote.
 
-Full live retrieval completed the Researchdata and Dataportalen inventories, but external enrichment exhausted retries on the [SNSN Kiruna dataset landing page](https://www.snsn.se/data/Kir23.php), which returned HTTP 500. The approved strict failure policy prevented replacement of current data or advancement of its boundary. A successful full harvest, incremental rerun and GitHub workflow execution remain pending; the old database and exports have therefore not been deleted.
+Full live retrieval has verified both catalog inventories. A new full run is in progress with external failures recorded as unavailable, including the [SNSN Kiruna dataset landing page](https://www.snsn.se/data/Kir23.php), which returned HTTP 500. Full-output comparison, an incremental rerun and GitHub workflow execution remain pending; the old database and exports have therefore not been deleted.
 
 ## Migrate the former SQLite catalog
 

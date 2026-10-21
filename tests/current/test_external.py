@@ -246,15 +246,18 @@ async def test_permanent_access_outcomes_are_explicit(status, outcome):
     assert files == []
 
 
-async def test_transient_failure_propagates_instead_of_reporting_no_files():
-    with pytest.raises(httpx.HTTPStatusError):
-        await enrich_records(
-            FakeTransport(lambda request: httpx.Response(503)),
-            research("https://example.org/dataset/1"),
-            {},
-            [],
-            [],
-        )
+async def test_transient_failure_is_recorded_without_discarding_other_resources():
+    external, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(503)),
+        research("https://example.org/dataset/1"),
+        {},
+        [],
+        [],
+    )
+    assert external[0]["status"] == "unavailable"
+    assert external[0]["http_status"] == 503
+    assert external[0]["metadata"] is None
+    assert files == []
 
 
 async def test_redirect_to_repository_uses_api_and_retains_landing_metadata():
@@ -419,14 +422,71 @@ async def test_researchdata_owned_pages_and_restricted_data_files_are_not_fetche
 
 
 async def test_304_without_previous_successful_metadata_is_an_error():
-    with pytest.raises(ValueError, match="without reusable metadata"):
-        await enrich_records(
-            FakeTransport(lambda request: httpx.Response(304)),
-            research("https://example.org/dataset/1"),
-            {},
-            [],
-            [],
-        )
+    external, _ = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(304)),
+        research("https://example.org/dataset/1"),
+        {},
+        [],
+        [],
+    )
+    assert external[0]["status"] == "unavailable"
+    assert "without reusable metadata" in external[0]["error"]
+
+
+async def test_external_failure_retains_metadata_files_and_recovers_on_304():
+    url = "https://example.org/current"
+    payload = {
+        "@type": "Dataset",
+        "@id": url,
+        "distribution": {"contentUrl": "https://example.org/data.csv"},
+        "custom": ["a", "b"],
+    }
+    first, _ = await enrich_records(
+        FakeTransport(
+            lambda request: httpx.Response(200, json=payload, headers={"ETag": "abc"})
+        ),
+        research(url),
+        {},
+        [],
+        [],
+    )
+    before = copy.deepcopy(first)
+    failed, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(500)), research(url), {}, [], first
+    )
+    assert first == before
+    assert failed[0]["metadata"] == payload
+    assert failed[0]["metadata_stale"] is True
+    assert files[0]["status"] == "unverified"
+    recovered, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(304)),
+        research(url),
+        {},
+        [],
+        failed,
+    )
+    assert recovered == first
+    assert files[0]["status"] == "discovered"
+
+
+async def test_failed_external_resource_keeps_migrated_file_discovery():
+    url = "https://zenodo.org/api/records/1"
+    old = {
+        "identifier": "dataset",
+        "url": "https://example.org/data.csv",
+        "metadata": {"landing_url": "https://zenodo.org/records/1", "size": 12},
+    }
+    _, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(500)),
+        research(url),
+        {},
+        [],
+        [],
+        [old],
+    )
+    assert files[0]["url"] == old["url"]
+    assert files[0]["metadata"]["size"] == 12
+    assert files[0]["status"] == "unverified"
 
 
 async def test_rdf_literals_and_multiple_download_links_survive():
@@ -542,4 +602,135 @@ async def test_ambiguous_jsonld_graph_does_not_assign_files_or_resources(
     )
     external, files = await enrich_records(transport, records, {}, [], [])
     assert external == []
+    assert files == []
+
+
+async def test_malformed_external_file_entries_retain_previous_metadata():
+    url = "https://example.org/current"
+    previous = [
+        {
+            "url": url,
+            "status": "available",
+            "metadata": {"name": "Original"},
+            "identifiers": ["dataset"],
+            "validators": {},
+            "related_metadata": [],
+        }
+    ]
+    external, files = await enrich_records(
+        FakeTransport(
+            lambda request: httpx.Response(200, json={"files": {"entries": []}})
+        ),
+        research(url),
+        {},
+        [],
+        previous,
+    )
+    assert external[0]["status"] == "unavailable"
+    assert external[0]["metadata"] == {"name": "Original"}
+    assert "file entries" in external[0]["error"]
+    assert files == []
+
+
+async def test_failed_external_resource_does_not_retain_previous_owner_metadata():
+    url = "https://example.org/current"
+    previous = [
+        {
+            "url": url,
+            "status": "available",
+            "metadata": {"name": "Old revision"},
+            "identifiers": ["old-revision"],
+            "validators": {},
+            "related_metadata": [],
+        }
+    ]
+    external, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(500)),
+        research(url),
+        {},
+        [],
+        previous,
+    )
+    assert external[0]["status"] == "unavailable"
+    assert external[0]["metadata"] is None
+    assert files == []
+
+
+async def test_invalid_external_jsonld_identifier_is_an_unavailable_outcome():
+    external, files = await enrich_records(
+        FakeTransport(
+            lambda request: httpx.Response(
+                200, json={"@graph": [{"@id": [], "@type": "Dataset"}]}
+            )
+        ),
+        research("https://example.org/current"),
+        {},
+        [],
+        [],
+    )
+    assert external[0]["status"] == "unavailable"
+    assert "Invalid metadata" in external[0]["error"]
+    assert files == []
+
+
+async def test_malformed_external_file_metadata_with_version_owner_is_unavailable():
+    url = "https://example.org/current"
+    records = research(url)
+    records["dataset"]["identities"].append(
+        {
+            "value": "10.1234/version",
+            "relation": "version",
+            "normalized": "doi:10.1234/version",
+        }
+    )
+    payload = {
+        "@graph": [
+            {
+                "@id": "https://doi.org/10.1234/version",
+                "@type": "Dataset",
+                "files": {"entries": []},
+            }
+        ]
+    }
+    external, files = await enrich_records(
+        FakeTransport(lambda request: httpx.Response(200, json=payload)),
+        records,
+        {},
+        [],
+        [],
+    )
+    assert (
+        next(item for item in external if item["url"] == url)["status"] == "unavailable"
+    )
+    assert files == []
+
+
+async def test_stale_external_payload_never_acquires_new_owners_across_failures():
+    url = "https://example.org/current"
+    record = research(url)["dataset"]
+    payload = {
+        "@type": "Dataset",
+        "@id": url,
+        "distribution": {"contentUrl": "https://example.org/old.csv"},
+    }
+    previous = [
+        {
+            "url": url,
+            "status": "available",
+            "metadata": payload,
+            "identifiers": ["a"],
+            "related_metadata": [],
+        }
+    ]
+    transport = FakeTransport(lambda request: httpx.Response(500))
+    first, files = await enrich_records(
+        transport, {"a": record, "b": record}, {}, [], previous
+    )
+    assert {item["identifier"] for item in files} == {"a"}
+    repeated, files = await enrich_records(
+        transport, {"a": record, "b": record}, {}, [], first
+    )
+    assert {item["identifier"] for item in files} == {"a"}
+    second, files = await enrich_records(transport, {"b": record}, {}, [], repeated)
+    assert second[0]["metadata"] is None
     assert files == []
