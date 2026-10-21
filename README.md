@@ -2,6 +2,10 @@
 
 Harvest the current [Researchdata catalog](https://researchdata.se/), its corresponding [Dataportalen](https://www.dataportal.se/) records, and accessible metadata from linked repositories.
 
+## Dataportalen API "guide"
+
+[Dataportalen API Guide](https://docs.dataportal.se/registry/api/)
+
 TO BE FILLED OUT ONCE THE IMPLEMENTATION THE NEW VERSION IS COMPLETED.
 
 ## Automatic Parquet and JSONL splitting before commits
