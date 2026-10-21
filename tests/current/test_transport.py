@@ -77,3 +77,21 @@ async def test_retry_after_is_honored(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         await Transport(Config(), client).request("GET", "https://example.org")
     assert sleeps == [2]
+
+
+async def test_request_metrics_include_redirects_and_detach_from_shared_client():
+    def respond(request):
+        if request.url.path == "/doi":
+            return httpx.Response(302, headers={"Location": "/dataset"})
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), follow_redirects=True
+    ) as client:
+        transport = Transport(Config(), client)
+        await transport.request("GET", "https://example.org/doi", metadata_only=True)
+        assert transport.requests == 2
+        assert transport.attempts == 1
+        await transport.close()
+        await client.get("https://example.org/dataset")
+        assert transport.requests == 2

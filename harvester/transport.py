@@ -3,6 +3,7 @@
 """Share bounded HTTP requests, retry policy and observable request counts."""
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -26,10 +27,16 @@ class Transport:
         self.owned = client is None
         self.semaphore = asyncio.Semaphore(config.concurrency)
         self.requests = 0
+        self.attempts = 0
         self.not_modified = 0
         self.bytes_received = 0
+        self.client.event_hooks["request"].append(self.count_request)
+
+    async def count_request(self, request: httpx.Request) -> None:
+        self.requests += 1
 
     async def close(self) -> None:
+        self.client.event_hooks["request"].remove(self.count_request)
         if self.owned:
             await self.client.aclose()
 
@@ -60,7 +67,7 @@ class Transport:
             response = None
             try:
                 async with self.semaphore:
-                    self.requests += 1
+                    self.attempts += 1
                     if metadata_only:
                         async with self.client.stream(
                             method, url, **kwargs
@@ -103,8 +110,19 @@ class Transport:
                         response.raise_for_status()
                     self.not_modified += response.status_code == 304
                     return response
-            except httpx.TransportError:
+                reason = f"HTTP {response.status_code} from {response.url}"
+            except httpx.TransportError as error:
                 if attempt == self.config.retries:
                     raise
-            await asyncio.sleep(self.delay(response, attempt))
+                reason = str(error) or type(error).__name__
+            delay = self.delay(response, attempt)
+            logging.getLogger(__name__).warning(
+                "Retry %d/%d for %s in %.1fs: %s",
+                attempt + 1,
+                self.config.retries,
+                url,
+                delay,
+                reason,
+            )
+            await asyncio.sleep(delay)
         raise RuntimeError("HTTP retries exhausted.")

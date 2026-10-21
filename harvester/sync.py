@@ -127,6 +127,7 @@ async def sync(
                     Counter(record["status"] for record in external)
                 ),
                 "requests": transport.requests,
+                "request_attempts": transport.attempts,
                 "not_modified": transport.not_modified,
                 "bytes_received": transport.bytes_received,
                 "elapsed_seconds": round(time.monotonic() - started, 2),

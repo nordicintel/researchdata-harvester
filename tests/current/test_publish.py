@@ -2,8 +2,11 @@
 # Copyright (c) 2026 NordicIntel
 """Reject publication races before creating a commit or staging files."""
 
+import subprocess
+
 import pytest
 
+from harvester.storage import COLLECTIONS, write_catalog
 from scripts import publish
 
 
@@ -44,3 +47,44 @@ def test_publication_stages_only_current_data(monkeypatch):
     assert publish.publish("old")
     assert ("add", "--all", "--", "data/current") in calls
     assert calls[-1] == ("push", "origin", "HEAD:main")
+
+
+def test_publication_pushes_complete_data_commit_to_real_git_remote(
+    tmp_path, monkeypatch
+):
+    remote = tmp_path / "remote.git"
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(checkout)
+
+    def git(*arguments):
+        return subprocess.check_output(
+            ["git", *arguments], text=True, stderr=subprocess.STDOUT
+        ).strip()
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "user.name", "Harvester test")
+    git("config", "user.email", "harvester@example.invalid")
+    (checkout / "README.md").write_text("Publication test\n")
+    git("add", "README.md")
+    git("commit", "-m", "Create test repository")
+    git("remote", "add", "origin", str(remote))
+    git("push", "origin", "main")
+    head = git("rev-parse", "HEAD")
+    write_catalog(
+        checkout / "data" / "current",
+        {name: [] for name in COLLECTIONS},
+        {},
+        {"boundary": "2026-10-21"},
+    )
+    (checkout / "unrelated.txt").write_text("Keep outside the publication commit\n")
+    assert publish.publish(head)
+    changed = git(
+        "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+    ).splitlines()
+    assert changed and all(path.startswith("data/current/") for path in changed)
+    assert git("ls-remote", "origin", "refs/heads/main").split()[0] == git(
+        "rev-parse", "HEAD"
+    )
+    assert "?? unrelated.txt" in git("status", "--porcelain")
