@@ -5,8 +5,6 @@ on:
     paths-ignore:
       - 'data/current/**'
   pull_request:
-    paths-ignore:
-      - 'data/current/**'
 permissions:
   contents: read
 jobs:
@@ -19,8 +17,8 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff check harvester scripts tests/current
-      - run: uv run ruff format --check harvester scripts tests/current
+      - run: uv run ruff check harvester scripts tests
+      - run: uv run ruff format --check harvester scripts tests
       - run: uv run python -m pytest
       - name: Validate the published catalog
         run: uv run python -c "from pathlib import Path; from harvester.storage import validate_catalog; print(validate_catalog(Path('data/current')))"

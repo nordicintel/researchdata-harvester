@@ -11,3 +11,4 @@ data/current/*
 .work/
 dist/
 *.egg-info/
+config.local.toml

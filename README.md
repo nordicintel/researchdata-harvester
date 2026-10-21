@@ -1,86 +1,174 @@
 # Researchdata harvester
 
-Harvest the current [Researchdata catalog](https://researchdata.se/) and its corresponding [Dataportalen](https://www.dataportal.se/) records. The current JSON files are both the published result and the state used by the next run.
+Harvest the current [Researchdata catalog](https://researchdata.se/), its corresponding [Dataportalen](https://www.dataportal.se/) records, and accessible metadata from linked repositories. Publish JSON-compatible metadata and file descriptions. The published current files also supply the next run's state.
 
-## Run a harvest
+## Set up and run
 
-Install Python 3.12 or later and [uv](https://docs.astral.sh/uv/), then run from this repository:
+Install Git, Python 3.12 or later, and [uv](https://docs.astral.sh/uv/). If Python is already installed, uv can be installed with:
 
 ```sh
+python -m pip install uv
+```
+
+Clone and prepare the repository:
+
+```sh
+git clone https://github.com/nordicintel/researchdata-harvester.git
+cd researchdata-harvester
 uv sync --locked
 uv run python -m scripts.sync
 ```
 
-The first run retrieves the current catalog. Subsequent runs retrieve changed Researchdata metadata, check both catalogs for additions and removals, and independently revalidate linked metadata. To refresh all current Researchdata representations:
+A fresh clone already contains current data. The default run reuses unchanged Researchdata records, retrieves changes with a one-day overlap, and checks complete catalog membership for additions and removals. Dataportalen metadata is refreshed independently in scoped batches. External resources use conditional requests where supported; otherwise they must be fetched to detect changes.
+
+To refresh all current Researchdata representations:
 
 ```sh
 uv run python -m scripts.sync --full
 ```
 
-`--config` selects a TOML configuration file. Relative data paths resolve against that file. `--destination` overrides the current output directory. `--report` writes an optional local JSON acceptance report, separate from the published metadata.
+Only current catalog records are retained. Exact source identifiers can include revision suffixes; this does not trigger historical retrieval. Restricted datasets remain in the catalog. Normal harvesting discovers file metadata but does not download research files, establish download rights, or grant redistribution permission.
 
-## Read the output
+### Command options
 
-`data/current/manifest.json` lists every compressed JSONL shard, its record count and checksum. Each line in a decompressed shard is a JSON object. Shards use stable identity hashes so unrelated additions do not move records between files.
-
-| Collection | Identity and content |
+| Option | Behavior |
 | --- | --- |
-| `researchdata` | Exact current OAI identifier, dataset base, datestamp, source identities, summary and three metadata representations. |
-| `dataportalen` | Dataset URI, identity evidence and complete retrieved metadata graph. |
-| `external` | Resource URL, owning Researchdata identifiers, complete retrieved metadata, access outcome and HTTP validators. |
-| `links` | Researchdata identifier, Dataportalen URI, matching rule, status and supporting evidence. |
-| `files` | Researchdata identifier, advertised file URL and available file attributes. |
+| `--full` | Refresh all current Researchdata representations instead of using the previous successful boundary. |
+| `--config PATH` | Read TOML settings, defaulting to `config.toml`. Relative configured output paths resolve against this file's directory. |
+| `--destination PATH` | Override the output directory. Relative CLI paths resolve against the working directory. |
+| `--report PATH` | Write the successful run's JSON report to this path, relative to the working directory. The report is also printed to standard output. |
 
-`matches.json` contains confirmed indirect mappings only. Direct identifier matches and ambiguous evidence remain in the links collection. `state.json` contains the successful sync boundary and matching fingerprints. There is no runtime database or historical catalog.
+An absent destination starts a fresh harvest and does not borrow state from `data/current/`. To test an incremental run without replacing tracked data, first copy the current directory to an ignored destination:
 
-Researchdata metadata preserves namespace names, attributes, ordered children, repeated values and mixed text in JSON trees. Embedded JSON-LD also has a parsed `json` value. Dataportalen graphs use `root` and `nodes`; predicates map to lists of typed terms. Blank-node references have `type: bnode` and resolve to a node key prefixed with `_:` within that record. Literal values retain their source spelling, language and datatype, including malformed source literals.
+```sh
+uv run python -c "import shutil; shutil.copytree('data/current', 'data/development/current')"
+uv run python -m scripts.sync --destination data/development/current --report data/development/report.json
+```
 
-The output contains current records only. Source identifiers can contain revision suffixes, but the harvester does not fetch previous revisions. One Dataportalen entry can legitimately correspond to several Researchdata records.
+Run the copy command only when the development destination is absent. Subsequent runs reuse that destination. Output directories should have separate parent directories because locking and temporary replacement paths are shared within each parent.
 
-## Retrieval and failure behavior
+## Configure retrieval
 
-The [Researchdata OAI-PMH service](https://api.researchdata.se/oai-pmh) supplies DataCite, DCAT and JSON-LD. A complete identifier inventory and the [sitemap](https://researchdata.se/catalogue/sitemap.xml) control membership. Collection pages do not count as datasets. Missing representations are retrieved individually; unavailable formats and inventory discrepancies are explicit outcomes.
+The checked-in `config.toml` contains operational defaults. For local overrides, copy it to ignored `config.local.toml`, edit the copy, and use `--config config.local.toml`. Unknown settings are rejected.
 
-Dataportalen enumeration uses the [Researchdata catalog membership document](https://admin.dataportal.se/store/818/metadata/9198), then retrieves scoped descriptions through its [SPARQL service](https://docs.dataportal.se/dcat/docs/sparql/). It does not scan the global catalog. Because this service has no established reliable record-level change signal, each run refreshes the scoped metadata in batches.
+| Setting | Default | Allowed values and purpose |
+| --- | --- | --- |
+| `current_directory` | `data/current` | Filesystem path. Change for a separate output location. Relative paths resolve against the configuration file. |
+| `oai_url` | `https://api.researchdata.se/oai-pmh` | Endpoint string. Change only for a verified replacement or test service. |
+| `sitemap_url` | `https://researchdata.se/catalogue/sitemap.xml` | Endpoint string for current membership reconciliation. |
+| `sparql_url` | `https://admin.dataportal.se/sparql` | Endpoint string for scoped Dataportalen descriptions. |
+| `catalog_metadata_url` | `https://admin.dataportal.se/store/818/metadata/9198` | Endpoint string for explicit Researchdata catalog membership. |
+| `catalog_uri` | `https://researchdata.se/catalogue/` | Catalog identity string used to establish scope. Verify upstream identity before changing. |
+| `timeout` | `90` | Positive seconds per HTTP timeout phase. Connection timeout is capped at 15 seconds. Increase for persistently slow sources. |
+| `concurrency` | `4` | Integer from 1 to 32. Maximum concurrent HTTP requests. Reduce when sources throttle requests. |
+| `retries` | `5` | Integer from 0 to 12. Retries after the initial request for transient failures. Server `Retry-After` instructions are honored. |
+| `identity_batch_size` | `100` | Integer from 1 to 500. Dataportalen batch size. Reduce if the service rejects large queries. |
 
-External enrichment runs automatically for dataset-owned resources. Zenodo and KTH use their record APIs; ICOS and SITES support structured metadata requests. Other linked dataset pages use structured JSON, JSON-LD, metadata tags and explicitly advertised alternate metadata. HTTP validators avoid unnecessary transfers where supported. A source without validators must be fetched again to establish whether it changed. Citations, prior versions and unrelated repository pages are excluded.
+URL settings are strings, not a guarantee that a supplied endpoint exists. Obtain replacement addresses and identities from upstream metadata or documentation.
 
-The harvester keeps restricted datasets and records unavailable metadata explicitly. File discovery does not establish download rights, tabular usability or redistribution permission. Normal harvesting does not download underlying research files.
+## Read the published data
 
-A failed required catalog inventory, malformed required catalog response or exhausted catalog retry leaves the published current directory and successful boundary unchanged. External network failures and malformed external metadata are recorded as unavailable after retries. Last-known metadata for the same current dataset is retained and marked stale; derived files are marked unverified. These outcomes do not block publication. Continuation tokens live only in memory. Local writers use an OS lock; directory replacement retains the previous directory only while the swap completes. A later invocation recovers an interrupted swap.
+`data/current/manifest.json` lists the gzip JSONL shards, record counts, and SHA-256 checksums. Discover filenames through this manifest. Each decompressed line is one JSON object. Deterministic compression and identity-based partitions keep unrelated changes local; oversized partitions split to keep individual published files below 100 MB.
 
-## GitHub operation
+| Collection | Identity and relationships | Content |
+| --- | --- | --- |
+| `researchdata` | `identifier` is the exact current OAI ID. | Dataset ID, datestamp, identities, summary, and DataCite, DCAT, and JSON-LD representations. |
+| `dataportalen` | `uri` is the exact dataset URI. | Identity evidence and the complete retrieved metadata graph. |
+| `external` | `url` identifies a resource; `identifiers` lists its current Researchdata owners. | Retrieved metadata, access outcome, HTTP validators, and stale-metadata information. |
+| `links` | `identifier` joins Researchdata; `uri` joins Dataportalen. Identity also includes `rule`. | Relationship, matching rule, status, and source evidence. |
+| `files` | The pair `identifier`, `url` identifies a file association. | Advertised file attributes and provenance; availability is not proof of download access. |
 
-The public repository is [nordicintel/researchdata-harvester](https://github.com/nordicintel/researchdata-harvester). The Harvest workflow runs daily at 03:17 UTC and can be started manually. It restores current files from `main`, runs the same sync command and publishes one data-only commit. It does not force-push or overwrite a newer `main` commit. Scheduled and manual harvests are serialized.
+Multiple links can be legitimate. `matched` and `ambiguous` statuses must remain distinguishable; ambiguous evidence is not a confirmed identity. External payloads retained after a failure have `metadata_stale`; `metadata_identifiers` records the owners of that retained payload. Files derived only from stale metadata are unverified.
 
-Published files remain below 100 MB. Compression is deterministic; oversized partitions split by additional identity-hash digits. The harvester retains one current output set. Ordinary Git history remains ordinary repository history.
+Researchdata XML inputs become JSON trees that preserve namespaces, attributes, ordered children, repeated values, and mixed text. Embedded JSON-LD also has a parsed `json` value. Dataportalen metadata uses `root` and `nodes`; predicates contain lists of typed terms. Blank-node references resolve within the record using `_:` node keys. Literals retain source spelling, language, and datatype. Source values and conflicting representations remain separate.
 
-## Validate changes
+The following standard-library example streams one collection without loading the complete catalog:
+
+```python
+import gzip
+import json
+from pathlib import Path
+
+current = Path('data/current')
+manifest = json.loads((current / 'manifest.json').read_text(encoding='utf-8'))
+for shard in manifest['collections']['researchdata']['files']:
+    with gzip.open(current / shard['name'], 'rt', encoding='utf-8') as stream:
+        for line in stream:
+            record = json.loads(line)
+            print(record['identifier'])
+```
+
+`matches.json` stores confirmed indirect mappings. Direct matches and ambiguities are represented in `links`. `state.json` stores the last successful boundary and matching fingerprints. HTTP validators reside with external records. Keep the manifest, collections, mappings, and state together; do not hand-edit individual generated files.
+
+## Sources and failure handling
+
+The [OAI-PMH service](https://api.researchdata.se/oai-pmh) supplies the three Researchdata representations. Complete OAI membership is reconciled with the [sitemap](https://researchdata.se/catalogue/sitemap.xml), excluding collection pages. Dataportalen uses the explicit catalog membership document and its [SPARQL service](https://docs.dataportal.se/dcat/docs/sparql/), without scanning the global catalog.
+
+External enrichment follows dataset identities and explicitly linked metadata resources, excluding citations, previous versions, and unrelated navigation. Zenodo and KTH use repository APIs; ICOS and SITES support structured requests. Other sources use structured landing-page metadata and advertised alternate metadata. Results are shared across current datasets referencing the same resource.
+
+Required catalog failures prevent publication and successful-boundary advancement. External failures become explicit outcomes after retries and do not block publication. Previously retrieved metadata remains available only for the same current owners and is marked stale until recovery.
+
+Interrupted runs restart pagination and reuse the last successful published state. There are no persistent page checkpoints. Candidate validation precedes replacement, and a later invocation automatically recovers an interrupted directory swap.
+
+| Problem | Action |
+| --- | --- |
+| Required Researchdata or Dataportalen retrieval fails | Inspect the failing endpoint and error, then rerun after recovery. Keep the existing current data and state together. |
+| External resource is restricted, unavailable, or unsupported | Inspect the resource outcome. The run can succeed; stale metadata and unverified files remain explicit. |
+| Configuration is rejected | Correct the named setting using the table above. Check TOML syntax and path resolution. |
+| Catalog checksum or relationship validation fails | Stop publication. Restore the complete current directory from a known valid Git commit, then validate and rerun. Do not regenerate checksums to hide unexplained changes. |
+| Another process holds the catalog lock | Wait for that process or stop it deliberately before retrying. The lock filename alone does not indicate a live owner. |
+| A run was interrupted | Rerun the same command. Do not manually delete lock or replacement directories as routine recovery. |
+| Remote `main` advanced before publication | Update to the newer `main` and rerun against its current state. Never force-push the older candidate. |
+
+The JSON run report includes collection counts, Researchdata reuse and reconciliation, linked and unlinked counts, link statuses, external outcomes, request totals, and elapsed seconds. Counts of linked records include ambiguous links; inspect `link_statuses` and the links collection before treating coverage as confirmed. A report file is written only after successful completion; use the process error or Actions log for failed runs.
+
+## Operate GitHub Actions
+
+The [Harvest workflow](https://github.com/nordicintel/researchdata-harvester/actions/workflows/harvest.yml) runs daily at **03:17 UTC**. To start it manually, open **Actions**, select **Harvest**, then **Run workflow** on `main`. Leave `full` unchecked for incremental operation or select it for a full refresh.
+
+Scheduled and manual harvests are serialized without canceling active runs. Each run checks out current `main`, uses Python 3.12 and locked uv dependencies, and publishes validated current data in one data-only commit. The workflow has a 180-minute timeout. A normal push never overwrites a newer `main` commit.
+
+The Validate workflow checks code changes and all pull requests, including proposed data changes. Routine data-only pushes skip this workflow because the harvester validates the candidate before publication.
+
+### Publish manually
+
+Prefer the Harvest workflow. For manual publication, start on up-to-date `main`, with committed code, a clean index, Git author identity, and permission to push. Record the starting commit before running the harvest. In PowerShell:
+
+```powershell
+git pull --ff-only
+$harvestHead = git rev-parse HEAD
+uv run python -m scripts.sync
+if ($LASTEXITCODE -ne 0) { throw 'Harvest failed; do not publish.' }
+uv run python -m scripts.publish --expected-head $harvestHead
+```
+
+The publisher validates `data/current/`, checks local and remote HEAD against the recorded commit, and commits only generated current data. If `main` advances, preserve any unrelated local work, restore the newer complete current state, and repeat the harvest. Do not force-push or mix an old candidate with new state. Ordinary Git history is retained; the harvester does not maintain historical snapshots.
+
+## Maintain the code
+
+| Directory | Responsibility |
+| --- | --- |
+| `harvester/` | Source retrieval, metadata conversion, matching, current-state persistence, and coordination. |
+| `scripts/` | Executable sync and publication commands. |
+| `tests/` | Offline behavior tests, including local Git publication tests. |
+| `.github/workflows/` | Validation and scheduled or manual harvesting. |
+| `data/current/` | Tracked generated metadata and the state needed for the next run. |
+
+This is a directly executed repository with internal Python modules, not an installed library. Use English identifiers and documentation, type annotations, asynchronous httpx requests, and uv-managed dependencies. Keep source-owned fields and metadata fidelity intact.
+
+Run these checks before committing:
 
 ```sh
 uv run python -m pytest
-uv run ruff check harvester scripts tests/current
-uv run ruff format --check harvester scripts tests/current
+uv run ruff check harvester scripts tests
+uv run ruff format --check harvester scripts tests
+uv run python -m scripts.sync --help
+uv run python -m scripts.publish --help
+uv run python -c "from pathlib import Path; from harvester.storage import validate_catalog; print(validate_catalog(Path('data/current')))"
 ```
 
-Default tests are offline. Live acceptance is a separate full harvest and subsequent incremental run, with counts, relationships and unchanged-output behavior checked against the migrated catalog. The GitHub Validate workflow runs the offline tests and validates the published files.
+These checks are offline. Source-facing changes also need a live harvest with coverage, matching outcomes, and failure behavior examined. Use the isolated development destination above for experiments, then verify the normal workflow. Keep code changes and generated data refreshes in separate commits.
 
-### Verification status on 21 October 2026
+To update dependencies, run `uv lock --upgrade`, then `uv sync --locked` and the checks above. For a targeted update, use `uv lock --upgrade-package PACKAGE`. Review and commit the lockfile diff. Changes to network, XML, or RDF dependencies also require live source verification.
 
-The [full GitHub harvest](https://github.com/nordicintel/researchdata-harvester/actions/runs/39613648484) completed and published 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 links, 4,394 external resource outcomes and 24,749 file records. OAI and sitemap dataset membership matched exactly. All 6,691 Researchdata source representation sets matched the migrated metadata exactly. All migrated dataset identities and relationships were retained. Every previous file remains represented; 650 URL changes were percent-encoding differences, and 1,313 additional file records were discovered.
-
-The full run took 2,343 seconds and made 22,829 HTTP requests including redirects and retries. External outcomes were 2,500 available, 310 represented by Researchdata itself, 1,338 unavailable, 241 restricted and five unsupported. Persistent upstream HTTP 503 responses accounted for much of the retry work. Completion does not mean every external resource or research file is accessible.
-
-The [incremental GitHub harvest](https://github.com/nordicintel/researchdata-harvester/actions/runs/39619862689) also completed and published. It reused 6,687 Researchdata records, fetched four records per format within the overlap window, and kept all collection counts unchanged. Dataportalen metadata, links and the confirmed mapping file were byte-identical. It received 83 HTTP 304 responses, made 17,968 HTTP requests and took 1,617 seconds. External resources recovered independently: 3,809 are available, 31 unavailable, 239 restricted, five unsupported and 310 represented by Researchdata itself.
-
-The rerun exposed only an ordering difference in four refreshed identity-evidence lists. A deterministic ordering fix now passes a regression across three separate Python hash seeds. All source metadata and identity evidence values were unchanged. The 87 offline tests pass, and GitHub validation passed on Ubuntu with Python 3.12. Eight existing downloads passed integrity checks and remain in the local downloads folder. The obsolete SQLite database and export generations were moved to the Windows Recycle Bin after acceptance. Current output occupies about 89.8 MB across 83 files; the largest file is 12.3 MB.
-
-## Migrate the former SQLite catalog
-
-```sh
-uv run python -m scripts.migrate data/catalog.sqlite --report .audit/migration.json
-```
-
-Migration requires an absent destination. It opens SQLite read-only, retains current source metadata and relationships, and verifies existing downloads at their moved paths. The local download manifest stays under `data/downloads/`. Keep the old database until migration comparisons and live acceptance succeed.
-
-The unchanged `src/researchdata_harvester` directory is reference material. New execution does not import that package. Tests cover the current runner; obsolete package tests have been removed. `pyproject.toml` manages dependencies without building or installing a library. [PROJECT_SCOPE.md](PROJECT_SCOPE.md) records the agreed scope.
+Local downloads are outside normal harvesting and remain ignored under `data/downloads/`. Preserve their integrity manifest when cleaning local files. Local reports, configuration overrides, environments, and temporary candidates are not published.
