@@ -3,6 +3,9 @@
 """Offline source fixtures protect current membership and metadata fidelity."""
 
 import json
+import os
+import subprocess
+import sys
 from copy import deepcopy
 from types import SimpleNamespace
 from xml.sax.saxutils import escape
@@ -461,3 +464,23 @@ def test_unresolved_graph_datasets_do_not_supply_identity(
     )
     assert all(item["format"] == "datacite" for item in current["identities"])
     assert jsonld_documents(current["representations"]["json_ld"]) == [document]
+
+
+def test_identity_evidence_order_is_stable_across_processes():
+    program = """
+import json
+from harvester.metadata import extract_evidence
+payload = {"@type": "Dataset", "identifier": "10.1234/current",
+           "@id": "https://doi.org/10.1234/current", "url": "https://example.org/current"}
+tree = {"tag": "jsonLdString", "text": json.dumps(payload)}
+print(json.dumps(extract_evidence(tree), sort_keys=True))
+"""
+    outputs = {
+        subprocess.check_output(
+            [sys.executable, "-c", program],
+            env=os.environ | {"PYTHONHASHSEED": seed},
+            text=True,
+        )
+        for seed in ("1", "2", "3")
+    }
+    assert len(outputs) == 1

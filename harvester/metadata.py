@@ -189,7 +189,7 @@ def extract_evidence(
                     )
     for document in jsonld_documents(tree):
         for entity in owned_datasets(document, primary_identifiers or set()):
-            for key in IDENTITY_NAMES:
+            for key in sorted(IDENTITY_NAMES):
                 for value in scalar_values(entity.get(key, [])):
                     result.append(
                         {
