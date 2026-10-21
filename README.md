@@ -65,6 +65,12 @@ uv run ruff format --check harvester scripts tests/current
 
 Default tests are offline. Live acceptance is a separate full harvest and subsequent incremental run, with counts, relationships and unchanged-output behavior checked against the migrated catalog. The GitHub Validate workflow runs the offline tests and validates the published files.
 
+### Verification status on 21 October 2026
+
+The current files are the verified SQLite migration: 6,691 Researchdata records, 6,626 Dataportalen records, 6,692 relationships and 23,436 file records. All Researchdata representation hashes and current relationship identities were retained, and eight existing downloads passed integrity checks. The 77 offline tests pass, including publication against a real local Git remote.
+
+Full live retrieval completed the Researchdata and Dataportalen inventories, but external enrichment exhausted retries on the [SNSN Kiruna dataset landing page](https://www.snsn.se/data/Kir23.php), which returned HTTP 500. The approved strict failure policy prevented replacement of current data or advancement of its boundary. A successful full harvest, incremental rerun and GitHub workflow execution remain pending; the old database and exports have therefore not been deleted.
+
 ## Migrate the former SQLite catalog
 
 ```sh
