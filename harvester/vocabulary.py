@@ -81,7 +81,7 @@ import tempfile
 from collections.abc import Callable, Collection, Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 from urllib.parse import urldefrag, urljoin, urlsplit
 from xml.sax import SAXException
 
@@ -97,9 +97,11 @@ from pydantic import (
 from pyld import jsonld
 from pyld.context_resolver import ContextResolver
 from rdflib import BNode, Graph, URIRef
+from rdflib import Literal as RdfLiteral
 from rdflib.compare import to_canonical_graph
 from rdflib.exceptions import ParserError
 from referencing import Registry, Resource
+from referencing._core import Resolver
 from referencing.exceptions import Unresolvable
 from referencing.jsonschema import DRAFT202012
 
@@ -353,46 +355,31 @@ class RdfCache:
             )
             if uri not in self._fetched and not reusable:
                 headers = {"Accept": accept}
-                if (
-                    previous
-                    and previous.data is not None
-                    and previous.source_url == url
-                ):
+                if previous and previous.data is not None and previous.source_url == url:
                     if previous.etag:
                         headers["If-None-Match"] = previous.etag
                     if previous.last_modified:
                         headers["If-Modified-Since"] = previous.last_modified
                 try:
-                    response = await client.get(
-                        url, headers=headers, follow_redirects=True
-                    )
+                    response = await client.get(url, headers=headers, follow_redirects=True)
                     if response.status_code == 304:
                         if (
                             not previous
                             or previous.data is None
-                            or not (
-                                "If-None-Match" in headers
-                                or "If-Modified-Since" in headers
-                            )
+                            or not ("If-None-Match" in headers or "If-Modified-Since" in headers)
                         ):
-                            raise ValueError(
-                                "Received 304 without a cached representation"
-                            )
+                            raise ValueError("Received 304 without a cached representation")
                         entry = previous.model_copy(
                             update={
                                 "outcome": "available",
                                 "error": None,
                                 "etag": response.headers.get("etag", previous.etag),
-                                "last_modified": response.headers.get(
-                                    "last-modified", previous.last_modified
-                                ),
+                                "last_modified": response.headers.get("last-modified", previous.last_modified),
                             }
                         )
                     else:
                         response.raise_for_status()
-                        data = _METADATA.validate_python(
-                            decoder(response) if decoder else response.json()
-                        )
+                        data = _METADATA.validate_python(decoder(response) if decoder else response.json())
                         entry = CacheEntry(
                             kind=kind,
                             source_url=url,
@@ -408,10 +395,9 @@ class RdfCache:
                         if isinstance(error, httpx.HTTPStatusError)
                         else type(error).__name__
                     )
-                    entry = (
-                        previous
-                        or CacheEntry(kind=kind, source_url=url, outcome="unavailable")
-                    ).model_copy(update={"outcome": "unavailable", "error": reason})
+                    entry = (previous or CacheEntry(kind=kind, source_url=url, outcome="unavailable")).model_copy(
+                        update={"outcome": "unavailable", "error": reason}
+                    )
                     logger.debug("RDF cache refresh failed: %s", reason)
                 self._entries[uri] = entry
                 self._fetched[uri] = url
@@ -465,9 +451,7 @@ def _write_cache(path: Path, entries: Mapping[str, object]) -> None:
         + b"\n"
     )
     buffer = io.BytesIO()
-    with gzip.GzipFile(
-        filename="", mode="wb", fileobj=buffer, mtime=0, compresslevel=9
-    ) as archive:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=buffer, mtime=0, compresslevel=9) as archive:
         archive.write(payload)
     compressed = buffer.getvalue()
     if path.exists() and path.read_bytes() == compressed:
@@ -559,7 +543,7 @@ def _decode_definition(response: httpx.Response) -> dict[str, JsonValue]:
     }
     if media_type not in formats:
         document = _DOCUMENT.validate_python(response.json())
-        return {"@graph": document} if isinstance(document, list) else document
+        return {"@graph": list(document)} if isinstance(document, list) else document
     try:
         graph = to_canonical_graph(
             Graph().parse(
@@ -578,7 +562,7 @@ def _decode_definition(response: httpx.Response) -> dict[str, JsonValue]:
             term["type"] = "uri"
         elif isinstance(obj, BNode):
             term = {"type": "bnode", "value": "_:" + str(obj)}
-        else:
+        elif isinstance(obj, RdfLiteral):
             if obj.language:
                 term["lang"] = obj.language
             if obj.datatype:
@@ -587,12 +571,12 @@ def _decode_definition(response: httpx.Response) -> dict[str, JsonValue]:
     for fields in result.values():
         for terms in fields.values():
             terms.sort(key=lambda value: json.dumps(value, sort_keys=True))
-    return result
+    return cast(dict[str, JsonValue], result)
 
 
 def _normalize(
-    document: dict | list, source_url: str, loader: Callable
-) -> tuple[list[dict], list[str]]:
+    document: dict[str, Any] | list[dict[str, Any]], source_url: str, loader: Callable[..., dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Canonicalize RDF/JSON or JSON-LD in a worker, with a cache-backed loader."""
     dropped: set[str] = set()
     options = {
@@ -607,10 +591,7 @@ def _normalize(
         and isinstance(fields, dict)
         and all(
             isinstance(terms, list)
-            and all(
-                isinstance(term, dict) and "type" in term and "value" in term
-                for term in terms
-            )
+            and all(isinstance(term, dict) and "type" in term and "value" in term for term in terms)
             for terms in fields.values()
         )
         for entity, fields in document.items()
@@ -619,12 +600,8 @@ def _normalize(
         triples = []
         for subject, fields in _RDF_JSON.validate_python(document).items():
             for predicate, terms in fields.items():
-                if not urlsplit(predicate).scheme or not (
-                    subject.startswith("_:") or urlsplit(subject).scheme
-                ):
-                    raise ValueError(
-                        "RDF/JSON subjects and predicates must be absolute IRIs or subject blank nodes"
-                    )
+                if not urlsplit(predicate).scheme or not (subject.startswith("_:") or urlsplit(subject).scheme):
+                    raise ValueError("RDF/JSON subjects and predicates must be absolute IRIs or subject blank nodes")
                 for term in terms:
                     obj = {
                         "type": {
@@ -635,17 +612,15 @@ def _normalize(
                         "value": term.value,
                     }
                     if term.type == "literal":
-                        obj["datatype"] = term.datatype or NAMESPACES[
-                            "rdf" if term.lang else "xsd"
-                        ] + ("langString" if term.lang else "string")
+                        obj["datatype"] = term.datatype or NAMESPACES["rdf" if term.lang else "xsd"] + (
+                            "langString" if term.lang else "string"
+                        )
                         if term.lang:
                             obj["language"] = term.lang
                     triples.append(
                         {
                             "subject": {
-                                "type": "blank node"
-                                if subject.startswith("_:")
-                                else "IRI",
+                                "type": "blank node" if subject.startswith("_:") else "IRI",
                                 "value": subject,
                             },
                             "predicate": {"type": "IRI", "value": predicate},
@@ -678,9 +653,7 @@ def _normalize(
                     "entity_id": scoped(triple["subject"]["value"]),
                     "graph_id": None if graph == "@default" else scoped(graph),
                     "property": triple["predicate"]["value"],
-                    "value": scoped(obj["value"])
-                    if obj["type"] == "blank node"
-                    else obj["value"],
+                    "value": scoped(obj["value"]) if obj["type"] == "blank node" else obj["value"],
                     "value_type": {
                         "IRI": "uri",
                         "blank node": "bnode",
@@ -729,14 +702,11 @@ class SemanticResolver:
         self._full = full
         self._limit = asyncio.Semaphore(concurrency)
         self._documents = {
-            namespace: namespace.rstrip("#").replace("http://", "https://", 1)
-            for namespace in NAMESPACES.values()
+            namespace: namespace.rstrip("#").replace("http://", "https://", 1) for namespace in NAMESPACES.values()
         }
-        self._documents[NAMESPACES["schema"]] = (
-            "https://schema.org/version/latest/schemaorg-current-https.jsonld"
-        )
+        self._documents[NAMESPACES["schema"]] = "https://schema.org/version/latest/schemaorg-current-https.jsonld"
         self._documents.update(documents or {})
-        self._definitions: dict[str, asyncio.Task] = {}
+        self._definitions: dict[str, asyncio.Task[tuple[CacheEntry, list[dict[str, Any]]]]] = {}
         self._active = False
         self._failed = False
         self._pending = 0
@@ -760,9 +730,7 @@ class SemanticResolver:
         if exc_type is None and not self._failed:
             _write_cache(self._updates, self._cache.changes())
 
-    async def _fetch(
-        self, uri: str, source_url: str, *, context: bool = False
-    ) -> CacheEntry:
+    async def _fetch(self, uri: str, source_url: str, *, context: bool = False) -> CacheEntry:
         async with self._limit:
             return await self._cache.fetch(
                 uri,
@@ -772,32 +740,26 @@ class SemanticResolver:
                 full=self._full,
                 required=context,
                 decoder=None if context else _decode_definition,
-                accept="application/ld+json, application/json"
-                if context
-                else _RDF_ACCEPT,
+                accept="application/ld+json, application/json" if context else _RDF_ACCEPT,
             )
 
     async def _properties(
-        self, document: dict | list, source_url: str
-    ) -> tuple[list[dict], list[str]]:
+        self, document: dict[str, Any] | list[dict[str, Any]], source_url: str
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         loop = asyncio.get_running_loop()
 
-        def loader(url: str, options: dict | None = None) -> dict:
+        def loader(url: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
             document_url = (
                 "https://schema.org/docs/jsonldcontext.jsonld"
                 if url.rstrip("/") in {"https://schema.org", "http://schema.org"}
                 else url
             )
-            future = asyncio.run_coroutine_threadsafe(
-                self._fetch(document_url, document_url, context=True), loop
-            )
+            future = asyncio.run_coroutine_threadsafe(self._fetch(document_url, document_url, context=True), loop)
             try:
                 entry = future.result(timeout=90)
             except TimeoutError:
                 future.cancel()
-                raise CacheFetchError(
-                    "JSON-LD context retrieval exceeded 90 seconds"
-                ) from None
+                raise CacheFetchError("JSON-LD context retrieval exceeded 90 seconds") from None
             return {
                 "contextUrl": None,
                 "documentUrl": entry.resolved_url or document_url,
@@ -815,25 +777,21 @@ class SemanticResolver:
                 return self._documents[namespace], self._documents[namespace]
         return urldefrag(uri).url, urldefrag(uri).url
 
-    async def _definition(self, key: str, url: str) -> tuple[CacheEntry, list[dict]]:
+    async def _definition(self, key: str, url: str) -> tuple[CacheEntry, list[dict[str, Any]]]:
         previous = self._cache._entries.get(key)
         entry = await self._fetch(key, url)
-        if entry.data is None:
+        if not isinstance(entry.data, dict):
             return entry, []
         try:
-            properties, _ = await self._properties(
-                entry.data, entry.resolved_url or url
-            )
+            properties, _ = await self._properties(entry.data, entry.resolved_url or url)
             return entry, properties
         except (ValueError, jsonld.JsonLdError, CacheFetchError) as error:
-            entry = (previous or entry).model_copy(
-                update={"outcome": "unavailable", "error": type(error).__name__}
-            )
+            entry = (previous or entry).model_copy(update={"outcome": "unavailable", "error": type(error).__name__})
             self._cache._entries[key] = entry
             return entry, []
 
     async def _schemas(
-        self, metadata: dict | list | bool, source_url: str, format: str
+        self, metadata: dict[str, Any] | list[dict[str, Any]] | bool, source_url: str, format: str
     ) -> ResolvedMetadata:
         """Collect schema definitions and resolve explicit references without inlining."""
         source = TypeAdapter(dict[str, JsonValue] | bool).validate_python(metadata)
@@ -843,9 +801,7 @@ class SemanticResolver:
         def retrieve(uri: str) -> Resource:
             if urlsplit(uri).scheme not in {"http", "https"}:
                 raise ValueError("Only HTTP(S) schema resources can be retrieved")
-            future = asyncio.run_coroutine_threadsafe(
-                self._fetch(uri, uri, context=True), loop
-            )
+            future = asyncio.run_coroutine_threadsafe(self._fetch(uri, uri, context=True), loop)
             try:
                 entry = future.result(timeout=90)
             except TimeoutError:
@@ -853,17 +809,16 @@ class SemanticResolver:
                 raise CacheFetchError("Schema retrieval exceeded 90 seconds") from None
             return Resource.from_contents(entry.data, default_specification=DRAFT202012)
 
-        def collect() -> tuple[dict, list]:
+        def collect() -> tuple[dict[str, JsonValue], list[dict[str, JsonValue]]]:
             root = Resource.from_contents(source, default_specification=DRAFT202012)
-            registry = (
-                Registry(retrieve=retrieve).with_resource(source_url, root).crawl()
-            )
+            # referencing uses an attrs wrapper whose constructor mypy cannot infer.
+            registry = Registry(retrieve=retrieve).with_resource(source_url, root).crawl()  # type: ignore[call-arg]
             resolver = registry.resolver(source_url)
             schemas: dict[str, JsonValue] = {}
             references: list[dict[str, JsonValue]] = []
             seen: set[tuple[str, str]] = set()
 
-            def visit(resource: Resource, current: object, identity: str) -> None:
+            def visit(resource: Resource, current: Resolver[Any], identity: str) -> None:
                 # Keep recursive schemas as references, never infinitely expanded trees.
                 signature = (identity, json.dumps(resource.contents, sort_keys=True))
                 if signature in seen:
@@ -893,17 +848,11 @@ class SemanticResolver:
                     try:
                         resolved = current.lookup(reference)
                     except Unresolvable as error:
-                        references.append(
-                            {**evidence, "outcome": "unavailable", "error": str(error)}
-                        )
+                        references.append({**evidence, "outcome": "unavailable", "error": str(error)})
                         continue
                     target = urljoin(urldefrag(identity).url, reference)
-                    references.append(
-                        {**evidence, "target": target, "outcome": "available"}
-                    )
-                    child = Resource.from_contents(
-                        resolved.contents, default_specification=DRAFT202012
-                    )
+                    references.append({**evidence, "target": target, "outcome": "available"})
+                    child = Resource.from_contents(resolved.contents, default_specification=DRAFT202012)
                     visit(child, resolved.resolver, target)
                 for child in resource.subresources():
                     child_id = child.id()
@@ -912,32 +861,22 @@ class SemanticResolver:
                         if child_id
                         else urldefrag(identity).url
                         + "#subschema/"
-                        + hashlib.sha256(
-                            json.dumps(child.contents, sort_keys=True).encode()
-                        ).hexdigest()[:16]
+                        + hashlib.sha256(json.dumps(child.contents, sort_keys=True).encode()).hexdigest()[:16]
                     )
                     visit(child, current.in_subresource(child), child_identity)
 
-            is_openapi = (
-                format == "openapi" or isinstance(source, dict) and "openapi" in source
-            )
+            is_openapi = format == "openapi" or isinstance(source, dict) and "openapi" in source
             if is_openapi:
-                if not isinstance(source, dict) or not str(
-                    source.get("openapi", "")
-                ).startswith("3."):
+                if not isinstance(source, dict) or not str(source.get("openapi", "")).startswith("3."):
                     raise ValueError("Expected an OpenAPI 3.x JSON document")
 
                 def embedded(value: JsonValue, path: str = "") -> None:
                     if isinstance(value, dict):
                         for key, child in value.items():
-                            pointer = (
-                                path + "/" + key.replace("~", "~0").replace("/", "~1")
-                            )
+                            pointer = path + "/" + key.replace("~", "~0").replace("/", "~1")
                             if key == "schema" or path == "/components/schemas":
                                 resolved = resolver.lookup("#" + pointer)
-                                resource = Resource.from_contents(
-                                    child, default_specification=DRAFT202012
-                                )
+                                resource = Resource.from_contents(child, default_specification=DRAFT202012)
                                 visit(
                                     resource,
                                     resolved.resolver,
@@ -958,9 +897,7 @@ class SemanticResolver:
             else:
                 identity = urljoin(source_url, root.id() or "")
                 visit(root, resolver.in_subresource(root), identity)
-            return dict(sorted(schemas.items())), sorted(
-                references, key=lambda row: json.dumps(row, sort_keys=True)
-            )
+            return dict(sorted(schemas.items())), sorted(references, key=lambda row: json.dumps(row, sort_keys=True))
 
         schemas, references = await asyncio.to_thread(collect)
         return ResolvedMetadata(
@@ -974,7 +911,7 @@ class SemanticResolver:
 
     async def resolve(
         self,
-        metadata: dict | list | bool,
+        metadata: dict[str, Any] | list[dict[str, Any]] | bool,
         *,
         source_url: str,
         format: Literal["auto", "rdf", "json-schema", "openapi"] = "auto",
@@ -995,9 +932,7 @@ class SemanticResolver:
         self._pending += 1
         try:
             schema_format = format in {"json-schema", "openapi"} or (
-                format == "auto"
-                and isinstance(metadata, dict)
-                and ("$schema" in metadata or "openapi" in metadata)
+                format == "auto" and isinstance(metadata, dict) and ("$schema" in metadata or "openapi" in metadata)
             )
             if schema_format:
                 return await self._schemas(metadata, source_url, format)
@@ -1008,32 +943,18 @@ class SemanticResolver:
                 row["value"]
                 for row in properties
                 if row["value_type"] == "uri"
-                and row["property"]
-                in _CONTROLLED_PROPERTIES | {NAMESPACES["rdf"] + "type"}
+                and row["property"] in _CONTROLLED_PROPERTIES | {NAMESPACES["rdf"] + "type"}
             )
-            documents = {
-                term: self._document(term)
-                for term in terms
-                if urlsplit(term).scheme in {"http", "https"}
-            }
+            documents = {term: self._document(term) for term in terms if urlsplit(term).scheme in {"http", "https"}}
             for key, url in documents.values():
                 if key not in self._definitions:
-                    self._definitions[key] = asyncio.create_task(
-                        self._definition(key, url)
-                    )
-            await asyncio.gather(
-                *(
-                    self._definitions[key]
-                    for key in sorted({key for key, _ in documents.values()})
-                )
-            )
-            semantics = {}
+                    self._definitions[key] = asyncio.create_task(self._definition(key, url))
+            await asyncio.gather(*(self._definitions[key] for key in sorted({key for key, _ in documents.values()})))
+            semantics: dict[str, dict[str, JsonValue]] = {}
             for term, (key, url) in sorted(documents.items()):
                 entry, rows = self._definitions[key].result()
                 lookup = term.replace("http://schema.org/", "https://schema.org/", 1)
-                descriptions = [
-                    row for row in rows if row["entity_id"] in {term, lookup}
-                ]
+                descriptions = [row for row in rows if row["entity_id"] in {term, lookup}]
                 semantics[term] = {
                     "source_url": entry.resolved_url or url,
                     "outcome": entry.outcome
@@ -1043,12 +964,8 @@ class SemanticResolver:
                     else "undefined",
                     "stale": entry.stale,
                     "error": entry.error,
-                    "labels": [
-                        row for row in descriptions if row["property"] in _LABELS
-                    ],
-                    "definitions": [
-                        row for row in descriptions if row["property"] in _DEFINITIONS
-                    ],
+                    "labels": [row for row in descriptions if row["property"] in _LABELS],
+                    "definitions": [row for row in descriptions if row["property"] in _DEFINITIONS],
                 }
             return ResolvedMetadata(
                 source=source,

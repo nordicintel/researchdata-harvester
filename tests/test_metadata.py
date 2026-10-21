@@ -106,9 +106,7 @@ def test_parquet_fidelity_and_publication_requirements(tmp_path: Path) -> None:
             "properties) VALUES (?, ?, ?, 'available', ?)",
             [dataset_uri, titles, [resource], [*titles, unknown, reference]],
         )
-        assert connection.sql("SELECT reason FROM publication_errors").fetchall() == [
-            ("table_membership_mismatch",)
-        ]
+        assert connection.sql("SELECT reason FROM publication_errors").fetchall() == [("table_membership_mismatch",)]
         connection.execute(
             "INSERT INTO dataportalen (dataset_uri, registry_entry_uri, metadata_url, "
             "registry_modified, registry_modified_value) VALUES (?, ?, ?, ?, ?)",
@@ -129,8 +127,7 @@ def test_parquet_fidelity_and_publication_requirements(tmp_path: Path) -> None:
         for table in ("datasets", "dataportalen"):
             path = tmp_path / f"{table}.parquet"
             connection.execute(
-                f"COPY (SELECT * FROM {table} ORDER BY dataset_uri) TO ? "
-                "(FORMAT PARQUET, COMPRESSION ZSTD)",
+                f"COPY (SELECT * FROM {table} ORDER BY dataset_uri) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)",
                 [str(path)],
             )
             assert connection.execute(
@@ -156,9 +153,7 @@ def test_parquet_fidelity_and_publication_requirements(tmp_path: Path) -> None:
         assert connection.sql("SELECT * FROM publication_errors").fetchall() == []
         resource["verification"] = None
         connection.execute("UPDATE datasets SET resources = ?", [[resource]])
-        assert connection.sql("SELECT reason FROM publication_errors").fetchall() == [
-            ("no_verified_tabular_resource",)
-        ]
+        assert connection.sql("SELECT reason FROM publication_errors").fetchall() == [("no_verified_tabular_resource",)]
 
 
 async def test_cache_refresh_sharing_and_failure_retention(tmp_path: Path) -> None:
@@ -183,9 +178,7 @@ async def test_cache_refresh_sharing_and_failure_retention(tmp_path: Path) -> No
     async def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         await asyncio.sleep(0)
-        return httpx.Response(
-            status, json=metadata if status == 200 else None, headers={"ETag": '"one"'}
-        )
+        return httpx.Response(status, json=metadata if status == 200 else None, headers={"ETag": '"one"'})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         cache = RdfCache.load(path)
@@ -230,9 +223,7 @@ async def test_cache_refresh_sharing_and_failure_retention(tmp_path: Path) -> No
             await RdfCache().fetch(uri, client, required=True)
 
 
-def test_cache_creation_merge_pruning_and_atomic_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cache_creation_merge_pruning_and_atomic_save(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "candidate" / "rdf-cache.json.gz"
     cache = RdfCache.load(path)
     cache.save(path)
@@ -283,9 +274,7 @@ def test_cache_creation_merge_pruning_and_atomic_save(
     assert path.read_bytes() == original
     assert list(path.parent.iterdir()) == [path]
     cache.save(path, referenced=set())
-    assert list(json.loads(gzip.decompress(path.read_bytes()))) == [
-        "https://example.org/vocabulary"
-    ]
+    assert list(json.loads(gzip.decompress(path.read_bytes()))) == ["https://example.org/vocabulary"]
     path.write_bytes(b"not a gzip file")
     with pytest.raises(gzip.BadGzipFile):
         RdfCache.load(path)
@@ -317,9 +306,7 @@ async def test_resolver_expansion_semantics_and_automatic_artifact(
     }
     rdf_json = {
         "https://data.example/dataset": {
-            namespace + "title": [
-                {"type": "literal", "lang": "sv", "value": "Mätning"}
-            ],
+            namespace + "title": [{"type": "literal", "lang": "sv", "value": "Mätning"}],
             namespace + "details": [{"type": "bnode", "value": "_:different"}],
             namespace + "citation": [{"type": "uri", "value": citation}],
         },
@@ -341,9 +328,7 @@ async def test_resolver_expansion_semantics_and_automatic_artifact(
         if request.headers.get("if-none-match") == '"one"':
             return httpx.Response(304)
         if url == context_document:
-            return httpx.Response(
-                200, json={"@context": context}, headers={"ETag": '"one"'}
-            )
+            return httpx.Response(200, json={"@context": context}, headers={"ETag": '"one"'})
         assert url == definition_url
         return httpx.Response(
             200,
@@ -353,9 +338,7 @@ async def test_resolver_expansion_semantics_and_automatic_artifact(
 
     baseline, updates = tmp_path / "rdf-cache.json.gz", tmp_path / "updates.json.gz"
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        async with SemanticResolver(
-            baseline, client, updates, documents={namespace: definition_url}
-        ) as resolver:
+        async with SemanticResolver(baseline, client, updates, documents={namespace: definition_url}) as resolver:
             first, second = await asyncio.gather(
                 resolver.resolve(metadata, source_url=source_url),
                 resolver.resolve(rdf_json, source_url=source_url),
@@ -373,9 +356,7 @@ async def test_resolver_expansion_semantics_and_automatic_artifact(
         cache.merge(json.loads(gzip.decompress(updates.read_bytes())))
         cache.save(baseline)
         original = baseline.read_bytes()
-        async with SemanticResolver(
-            baseline, client, updates, documents={namespace: definition_url}
-        ) as resolver:
+        async with SemanticResolver(baseline, client, updates, documents={namespace: definition_url}) as resolver:
             again = await resolver.resolve(metadata, source_url=source_url)
             assert again == first
         assert len(requests) == 2
@@ -395,14 +376,10 @@ async def test_resolver_failure_boundaries(tmp_path: Path) -> None:
             predicate: [{"type": "literal", "value": "preserved"}],
         }
     }
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(503))
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503))) as client:
         baseline, updates = tmp_path / "cache.gz", tmp_path / "updates.gz"
         async with SemanticResolver(baseline, client, updates) as resolver:
-            result = await resolver.resolve(
-                metadata, source_url="https://data.example/source"
-            )
+            result = await resolver.resolve(metadata, source_url="https://data.example/source")
             assert result.properties[0]["value"] == "preserved"
             assert result.semantics[predicate]["outcome"] == "unavailable"
         assert updates.exists()
@@ -417,9 +394,7 @@ async def test_resolver_failure_boundaries(tmp_path: Path) -> None:
         aborted = tmp_path / "aborted.gz"
         with pytest.raises(RuntimeError, match="abort"):
             async with SemanticResolver(baseline, client, aborted) as resolver:
-                await resolver.resolve(
-                    metadata, source_url="https://data.example/source"
-                )
+                await resolver.resolve(metadata, source_url="https://data.example/source")
                 raise RuntimeError("abort")
         assert not aborted.exists()
         with pytest.raises(ValueError, match="overwrite"):
@@ -445,23 +420,15 @@ async def test_schema_references_and_openapi(tmp_path: Path) -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(str(request.url))
         if request.url.path == "/unit.json":
-            return httpx.Response(
-                200, json={"$defs": {"unit": {"title": "Unit", "enum": ["kg", "m"]}}}
-            )
+            return httpx.Response(200, json={"$defs": {"unit": {"title": "Unit", "enum": ["kg", "m"]}}})
         assert request.url.path == "/missing.json"
         return httpx.Response(404)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        async with SemanticResolver(
-            tmp_path / "cache.gz", client, tmp_path / "updates.gz"
-        ) as resolver:
+        async with SemanticResolver(tmp_path / "cache.gz", client, tmp_path / "updates.gz") as resolver:
             result = await resolver.resolve(schema, source_url=source_url)
             assert result.source == schema
-            assert any(
-                value.get("title") == "Unit"
-                for value in result.schemas.values()
-                if isinstance(value, dict)
-            )
+            assert any(value.get("title") == "Unit" for value in result.schemas.values() if isinstance(value, dict))
             assert len(result.schemas) < 20
             assert {row["outcome"] for row in result.schema_references} == {
                 "available",
@@ -489,11 +456,7 @@ async def test_schema_references_and_openapi(tmp_path: Path) -> None:
                             "responses": {
                                 "200": {
                                     "content": {
-                                        "application/json": {
-                                            "schema": {
-                                                "$ref": "#/components/schemas/Measurement"
-                                            }
-                                        }
+                                        "application/json": {"schema": {"$ref": "#/components/schemas/Measurement"}}
                                     }
                                 }
                             }
@@ -501,18 +464,12 @@ async def test_schema_references_and_openapi(tmp_path: Path) -> None:
                     }
                 },
             }
-            result = await resolver.resolve(
-                api, source_url="https://schemas.example/api.json"
-            )
+            result = await resolver.resolve(api, source_url="https://schemas.example/api.json")
             assert result.schema_references[0]["outcome"] == "available"
             assert (
-                result.schemas[
-                    "https://schemas.example/api.json#/components/schemas/Measurement"
-                ]["description"]
+                result.schemas["https://schemas.example/api.json#/components/schemas/Measurement"]["description"]
                 == "A measured value"
             )
-            boolean = await resolver.resolve(
-                False, source_url=source_url, format="json-schema"
-            )
+            boolean = await resolver.resolve(False, source_url=source_url, format="json-schema")
             assert boolean.schemas[source_url] is False
         assert (tmp_path / "updates.gz").exists()

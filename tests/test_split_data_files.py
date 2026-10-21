@@ -49,9 +49,7 @@ def repository(tmp_path: Path) -> Path:
         shutil.copyfile(PROJECT / name, destination)
     config = tmp_path / "pyproject.toml"
     config.write_text(
-        config.read_text()
-        .replace("max_mb = 100", "max_mb = 0.04")
-        .replace("target_mb = 50", "target_mb = 0.02")
+        config.read_text().replace("max_mb = 100", "max_mb = 0.04").replace("target_mb = 50", "target_mb = 0.02")
     )
     hook = tmp_path / ".githooks/pre-commit"
     hook.chmod(hook.stat().st_mode | 0o111)
@@ -77,9 +75,7 @@ def create_data(path: Path) -> list[tuple]:
 
 
 @pytest.mark.parametrize("suffix", [".parquet", ".jsonl", ".parquet.gz", ".jsonl.gz"])
-def test_commit_splits_rows_without_staging_unrelated_edits(
-    repository: Path, suffix: str
-) -> None:
+def test_commit_splits_rows_without_staging_unrelated_edits(repository: Path, suffix: str) -> None:
     source = repository / f"sample data{suffix}"
     if ".jsonl" in suffix:
         expected_bytes = b"\r\n".join(
@@ -115,20 +111,9 @@ def test_commit_splits_rows_without_staging_unrelated_edits(
     assert not source.exists()
     assert all(p.stat().st_size < 40_000 for p in parts)
     if ".jsonl" in suffix:
-        contents = [
-            gzip.decompress(p.read_bytes())
-            if suffix.endswith(".gz")
-            else p.read_bytes()
-            for p in parts
-        ]
+        contents = [gzip.decompress(p.read_bytes()) if suffix.endswith(".gz") else p.read_bytes() for p in parts]
         assert b"".join(contents) == expected_bytes
-        assert (
-            sum(
-                len([json.loads(line) for line in data.splitlines()])
-                for data in contents
-            )
-            == 4000
-        )
+        assert sum(len([json.loads(line) for line in data.splitlines()]) for data in contents) == 4000
     else:
         with duckdb.connect() as connection:
             actual = []
@@ -136,17 +121,11 @@ def test_commit_splits_rows_without_staging_unrelated_edits(
                 decoded = repository / "decoded.parquet"
                 if suffix.endswith(".gz"):
                     decoded.write_bytes(gzip.decompress(part.read_bytes()))
-                actual.extend(
-                    connection.read_parquet(
-                        str(decoded if suffix.endswith(".gz") else part)
-                    ).fetchall()
-                )
+                actual.extend(connection.read_parquet(str(decoded if suffix.endswith(".gz") else part)).fetchall())
                 decoded.unlink(missing_ok=True)
         assert actual == expected
     assert untouched.read_bytes() == small_bytes
-    tracked = git(
-        repository, "ls-tree", "-r", "--name-only", "HEAD"
-    ).stdout.splitlines()
+    tracked = git(repository, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines()
     assert source.name not in tracked
     assert all(p.name in tracked for p in parts)
     assert "local.txt" not in tracked
@@ -154,15 +133,9 @@ def test_commit_splits_rows_without_staging_unrelated_edits(
     assert list(repository.glob(f"*_part_*_part_*{suffix}")) == []
 
 
-@pytest.mark.parametrize(
-    "problem", ["unstaged", "collision", "malformed", "truncated-gzip"]
-)
-def test_failed_commit_preserves_index_and_files(
-    repository: Path, problem: str
-) -> None:
-    source = repository / (
-        "data.parquet.gz" if problem == "truncated-gzip" else "data.parquet"
-    )
+@pytest.mark.parametrize("problem", ["unstaged", "collision", "malformed", "truncated-gzip"])
+def test_failed_commit_preserves_index_and_files(repository: Path, problem: str) -> None:
+    source = repository / ("data.parquet.gz" if problem == "truncated-gzip" else "data.parquet")
     create_data(source)
     if problem == "malformed":
         source.write_bytes(b"invalid parquet" * 4000)
@@ -191,9 +164,7 @@ def test_parts_can_exceed_target_when_below_maximum(tmp_path: Path) -> None:
     source = tmp_path / "wide.parquet"
     with duckdb.connect() as connection:
         columns = ", ".join(f"i AS column_{i}" for i in range(100))
-        connection.sql(f"SELECT {columns} FROM range(100) t(i)").write_parquet(
-            str(source), compression="zstd"
-        )
+        connection.sql(f"SELECT {columns} FROM range(100) t(i)").write_parquet(str(source), compression="zstd")
     maximum = source.stat().st_size
     target = maximum // 2 + 1
     parts = split_file(source, tmp_path, maximum, target)

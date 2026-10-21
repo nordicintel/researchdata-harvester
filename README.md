@@ -2,6 +2,40 @@
 
 Harvest the current [Researchdata catalog](https://researchdata.se/), its corresponding [Dataportalen](https://www.dataportal.se/) records, and accessible metadata from linked repositories.
 
+## Development
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
+`uv sync --locked`. The checked-in `.python-version` selects Python 3.12; uv
+installs it if necessary. Development dependencies are included by default.
+
+Run these checks before committing:
+
+```sh
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy
+uv run python -m pytest
+```
+
+Use `uv run ruff check --fix .` and `uv run ruff format .` to apply lint fixes
+and formatting. Ruff uses 120-character lines, double quotes and space
+indentation. Write English identifiers, type annotations and Google-style
+docstrings; use absolute imports. Strict mypy checks `harvester/` and `scripts/`.
+PyLD has no type stubs, so only its imports are exempted from missing-stub errors.
+
+The Validate workflow runs these offline checks on pushes and pull requests.
+It does not run a network harvest. Splitter tests stay outside the default
+suite; after changing the commit-hook script, also run:
+
+```sh
+uv run python -m pytest tests/test_split_data_files.py
+```
+
+Manage dependencies with `uv add` or `uv add --dev`. To upgrade locked versions,
+run `uv lock --upgrade`, then `uv sync --locked` and the checks above. Commit
+`pyproject.toml` and `uv.lock` together. Source-facing changes also need a scoped
+live check of the affected source.
+
 ## Dataportalen API "guide"
 
 [Dataportalen API Guide](https://docs.dataportal.se/registry/api/)

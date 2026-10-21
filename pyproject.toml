@@ -25,7 +25,12 @@ max_mb = 100
 target_mb = 50
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8"]
+dev = [
+    "mypy>=2.4.0",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -36,7 +41,22 @@ addopts = "--ignore=tests/test_split_data_files.py"
 
 [tool.ruff]
 target-version = "py312"
+line-length = 120
 extend-exclude = [".work"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["harvester", "scripts"]
+
+[[tool.mypy.overrides]]
+module = ["pyld", "pyld.*"]
+ignore_missing_imports = true

@@ -16,3 +16,5 @@ dist/
 *.egg-info/
 config.local.toml
 /legacy/
+
+.mypy_cache/
