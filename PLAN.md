@@ -2,11 +2,12 @@
 
 ## 1. Target structure
 
-Keep six focused implementation modules, two executable scripts, four test modules and two workflows. Use DuckDB for schema enforcement, SQL updates, validation and Parquet output. Published Parquet files, the compact inventory and one gzipped JSON RDF cache remain the persisted state; no permanent DuckDB database is required.
+Use the following tree as a suggested upper bound, not a requirement to create every file: at most six implementation modules, two executable scripts and four test modules, with two workflows. Names and responsibilities may change after the working prototype reveals the useful module seams, but the final repository must contain no more than eight production Python files and twelve Python files including tests. Prefer fewer files and fewer tests where they cover the essential behavior. Use DuckDB for schema enforcement, SQL updates, validation and Parquet output. Published Parquet files, the compact inventory and one gzipped JSON RDF cache remain the persisted state; no permanent DuckDB database is required.
 
 ```text
 researchdata-harvester/
 ├── README.md
+├── PLAN.md
 ├── pyproject.toml
 ├── uv.lock
 ├── config.toml
@@ -40,10 +41,8 @@ researchdata-harvester/
 │
 └── data/
     ├── current/
-    │   ├── datasets/
-    │   │   └── part-*.parquet
-    │   ├── dataportalen/
-    │   │   └── part-*.parquet
+    │   ├── datasets.parquet
+    │   ├── dataportalen.parquet
     │   ├── inventory.json
     │   ├── rdf-cache.json.gz
     │   └── manifest.json
@@ -51,13 +50,14 @@ researchdata-harvester/
     └── downloads/                    # Ignored, preserved existing downloads.
 ```
 
-The wildcard entries represent generated shards, not additional table types. Environments and tool caches are ignored and omitted from this tree.
+The target is exactly two Parquet files, one per table. Numbered parts are an exception only when the actual compressed table cannot fit below the 100 MB per-file limit; never pre-partition by hashes, publishers, worker count or arbitrary row counts. Environments and tool caches are ignored and omitted from this tree.
 
 ### Root files
 
 | File | Role |
 |---|---|
 | `README.md` | The operating guide covering setup, commands, inclusion rules, output schemas, maintenance and troubleshooting. Include external API documentation and examples for querying the Parquet tables with DuckDB. |
+| `PLAN.md` | The agreed implementation scope, sequence and acceptance criteria. Update this file when the user changes those decisions. |
 | `pyproject.toml` | Dependency-only Python 3.12+ project configuration, test settings and Ruff settings. Keep `package = false`; add no build configuration or installed CLI. |
 | `uv.lock` | Reproducible dependency versions for local execution and Actions. |
 | `config.toml` | Endpoints, paths, concurrency, timeouts, retry settings and verification limits. Default binary verification cap is 32 MiB. |
@@ -68,7 +68,7 @@ The wildcard entries represent generated shards, not additional table types. Env
 
 | File | Role |
 |---|---|
-| `harvester/runtime.py` | Load and validate configuration and provide the shared asynchronous HTTP client. Centralize concurrency limits, timeouts, retries and `Retry-After` handling. |
+| `harvester/runtime.py` | Load and validate configuration and provide the shared asynchronous HTTP client. Centralize logging setup, concurrency limits, timeouts, retries and `Retry-After` handling. |
 | `harvester/dataportalen.py` | Own the scoped inventory query, change detection and retrieval of complete Dataportalen metadata, including related entities. Reuse and revalidate cached RDF entities; confirm membership and exclusions before removal. |
 | `harvester/researchdata.py` | Resolve current Researchdata identities and retrieve available dataset metadata. Reuse confirmed associations and exact identities without full-catalog OAI enumeration or title-based matching. |
 | `harvester/external.py` | Retrieve metadata and resource descriptions from linked repositories, including existing Zenodo, KTH, ICOS and SITES cases. Share resource lookups and report unavailable outcomes. |
@@ -94,8 +94,8 @@ The wildcard entries represent generated shards, not additional table types. Env
 |---|---|
 | `.github/workflows/harvest.yml` | Run daily at 03:17 UTC or manually, with inventory, two parallel fetch jobs and one dependent build/publication job. |
 | `.github/workflows/validate.yml` | Run offline tests, Ruff, formatting checks and published-data validation for code and proposed data changes. |
-| `data/current/datasets/part-*.parquet` | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. |
-| `data/current/dataportalen/part-*.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. |
+| `data/current/datasets.parquet` | Typed metadata and verified resource descriptions for eligible datasets, including Researchdata and external enrichment. Keep this as one file whenever it fits below 100 MB. |
+| `data/current/dataportalen.parquet` | Complete corresponding Dataportalen metadata, with typed descriptive columns and related entities. Keep this as one file whenever it fits below 100 MB. |
 | `data/current/inventory.json` | Current source membership, modification indicators, confirmed associations and processing outcomes, including excluded or unresolved candidates. |
 | `data/current/rdf-cache.json.gz` | A URI-keyed JSON cache of fetched vocabulary definitions and shared RDF entities, compressed with gzip. Preserve RDF term types, languages, datatypes, linked nodes, source URLs and available HTTP validators. |
 | `data/current/manifest.json` | Schema version, output filenames, counts and checksums for a consistent published generation. |
@@ -165,8 +165,10 @@ Use explicit DuckDB schemas with `STRUCT` and list columns for repeated metadata
 - Preserve additional properties with source, entity/path, property, value, value type, language and datatype fields. Do not serialize the whole record into an opaque payload column.
 - Load previous rows, remove deleted or successfully replaced rows, and insert their replacements. Preserve prior rows when refreshing fails transiently.
 - Validate uniqueness, matching table membership, nested references and inventory outcomes before export.
-- Use stable identifier-based partitions and deterministic ordering. Split oversized partitions until every file is below 100 MB.
-- Preserve unchanged shards and avoid timestamp-only rewrites.
+- Aim for exactly two Parquet files: `datasets.parquet` and `dataportalen.parquet`. Write each complete table with Zstandard compression and deterministic identity ordering before considering a split.
+- Split only a table whose measured compressed output is 100 MB or larger, and use the fewest parts needed to keep each file below that limit. Use consecutive identity ranges and names such as `datasets-001.parquet`; the other table remains a single file if it fits.
+- Do not create many small parts for incremental updates or parallel workers. In particular, a collection of approximately 20 MB parts is unacceptable when it could fit in fewer files. Merge parts back when a later output fits in fewer files, and remove superseded filenames from the candidate.
+- Preserve unchanged output files and avoid timestamp-only rewrites. Report each table's compressed size and file count, and explain any split in the sync report. Consumers discover the actual filenames through the manifest.
 - Publish both tables, inventory, RDF cache and manifest together. Keep temporary DuckDB working storage under the ignored work directory.
 
 ## 5. Execution and publication
@@ -180,6 +182,16 @@ uv run python -m scripts.sync --full
 
 Keep `--config`, `--destination` and `--report`. Add stage selection for `inventory`, `dataportalen`, `researchdata` and `build`, with a shared work-directory argument so Actions invokes the same implementation.
 
+### Scoped execution and diagnostics
+
+- Support repeatable `--dataset-uri` selectors and `--limit N` for a small, deterministic sample. Explicit URI selection retrieves only those entries; a limited run stops after collecting its sample rather than enumerating the full catalog.
+- Scoped runs must use an ignored destination, are marked as incomplete catalog coverage, cannot infer removals or advance production state, and cannot be published by `scripts.publish`.
+- Support `--log-level DEBUG`. INFO logs show stage progress, counts and elapsed time; DEBUG logs include dataset identity, source, operation, redacted URL, request attempt, status or exception class, elapsed time, retry delay, cache decision and parsing outcome. Log an unexpected exception with its traceback and dataset context, without logging credentials, response bodies or observation rows.
+- Set explicit configurable limits from the prototype onward: 10 seconds to connect, 30 seconds of read inactivity, at most three request attempts, and a 90-second total deadline per HTTP operation including retries. Respect `Retry-After`; if its delay exceeds the remaining deadline, record exhaustion instead of retrying early.
+- Handle expected network errors as outcomes at the dataset/resource level so one external failure does not discard unrelated completed work. Required-source failures still prevent publication; unexpected programming errors remain visible and must not be silently converted into successful outcomes.
+- Preserve completed record results in the existing temporary stage artifacts as work proceeds. Allow a rerun against the same work directory to reuse those results and retry failed or unfinished records when the input plan, configuration and implementation revision are unchanged. This is temporary artifact reuse, not a new persistent checkpoint database or run-history system.
+- After an interrupted run, rerun only the failing dataset or stage before attempting the full catalog again. The README must include copyable scoped, debug and stage-rerun commands.
+
 The scheduled workflow runs inventory first, starts the two fetch jobs in parallel, then builds and publishes after both complete. Use run-specific artifacts, retained for one day; skip unnecessary jobs when nothing needs processing.
 
 - Serialize harvest runs without cancelling an active run.
@@ -190,17 +202,17 @@ The scheduled workflow runs inventory first, starts the two fetch jobs in parall
 - Verify action versions when implementing the workflow.
 - Keep `httpx`, Pydantic, useful parsing libraries and `tenacity`; use DuckDB for all Parquet operations and standard-library JSON/gzip for the RDF cache. Add no direct PyArrow dependency or adapter framework.
 
-## 6. Replacement and acceptance
+## 6. Required implementation order
 
-Implement the new path within the proposed structure, retaining old published data until acceptance passes.
+Follow these six steps in order. Retain old published data until final acceptance; do not run repeated full harvests or broad validation suites between small prototype edits.
 
-1. Establish DuckDB schemas, output validation and the stage runner.
-2. Implement the filtered registry inventory, changes and complete related metadata retrieval.
-3. Port necessary Researchdata/external retrieval and implement bounded data verification.
-4. Run a fresh live candidate harvest and classify every existing Dataportalen record under the new scope.
-5. Test unchanged reruns, source changes, removals, failures and interrupted publication. Verify real examples of every format before claiming live support.
-6. Replace the old published collections, delete superseded modules and tests, and update the README.
+1. **Define and implement only the essential behavior tests.** Cover inventory eligibility and changes, metadata preservation, actual-data verification with its limits, and safe publication/failure retention, including the two-file default. Use a few end-to-end scenarios through module interfaces rather than tests for every helper or an extensive matrix. This work may be delegated to one subagent explicitly configured as `gpt-6.1-sol` with `reasoning_effort="high"` while the main agent proceeds with step 2; restrict the subagent to the agreed tests and do not create additional agents.
+2. **Build a working prototype.** Implement the shortest runnable path from a scoped live inventory through retrieval and verification to the two DuckDB-written Parquet tables. Concentrate on making that path work; run it and diagnose concrete failures, but defer intermediate linting, broad test suites, exhaustive validation and polishing. Include scope selectors, explicit network limits and basic error context immediately so prototype runs cannot waste a full-catalog run on one uncaught HTTP failure.
+3. **Deepen the working modules.** Use the `ask-matt` router's `codebase-design` skill and its `DEEPENING.md` guidance. Identify functionality that belongs together, place clear seams around it and hide its complexity behind small interfaces that provide substantial useful behavior. Keep source-specific logic local, remove pass-through wrappers and unnecessary abstractions, and let the coordinator call a few complete operations rather than orchestrating their internal steps. The proposed filenames may change, but do not exceed eight production Python files or twelve including tests; do not add extra architecture documents or a second implementation tree.
+4. **Adapt the existing essential tests to those interfaces.** Preserve behavioral assertions, replace obsolete tests and remove redundant internal tests instead of layering new ones on top. Add a test only for a concrete, essential correctness risk or reproduced bug not covered by the small suite. Run the focused suite after the structure settles and fix real failures; do not introduce additional review or validation phases without a demonstrated need.
+5. **Finish diagnostic logging.** Implement the INFO progress and DEBUG request/cache/parser/error context described above using standard logging in the existing modules. Make one failed dataset diagnosable from its identity and log trail, without introducing a logging framework, extra modules or permanent log archives.
+6. **Exercise scoped runs, then complete acceptance and cutover.** First demonstrate selected-record execution, a bounded HTTP failure, retained successful artifact results and a targeted rerun. Then run the required offline checks, one complete live candidate harvest and an unchanged incremental rerun. Verify representative live resources for supported formats, report any unverified support, classify omissions under the new scope, and validate publication through the workflow. Only after acceptance replace old outputs, remove obsolete code and update the README.
 
 Remove full-catalog OAI enumeration, sitemap reconciliation, the general matching pipeline, old JSONL storage and redundant configuration. Preserve existing local downloads.
 
-Acceptance requires passing pytest, Ruff, formatting checks and complete DuckDB output validation; verified table joins and metadata fidelity; no duplicate growth; no publication after incomplete inventories; and a successful scheduled/manual workflow. Report eligible, excluded, unresolved and unavailable counts with reasons. Commit implementation separately from generated data.
+Acceptance requires passing the minimal pytest suite, Ruff, formatting checks and complete DuckDB output validation; verified table joins and metadata fidelity; no duplicate growth; no publication after incomplete inventories or scoped runs; and a successful scheduled/manual workflow. Confirm that there are exactly two Parquet files whenever both tables fit below 100 MB individually. Report eligible, excluded, unresolved and unavailable counts with reasons, plus file counts and compressed sizes. Run these checks at the final acceptance point, repeating only checks affected by a subsequent fix. Commit implementation separately from generated data.
