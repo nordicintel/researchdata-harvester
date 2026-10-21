@@ -120,6 +120,112 @@ Use landing/access URLs first, then explicit dataset links in descriptions. Pres
 
 Retrieve dataset-owned structured metadata and metadata representations needed to preserve available attributes. Do not crawl unrelated navigation, citations or previous versions.
 
+### Dataportalen API request contract
+
+Implement the following requests in `dataportalen.py`. Use the shared asynchronous HTTP client with `Accept: application/json`, no credentials, and the configured timeouts and retries. Pass query parameters through `httpx`'s `params` argument so URL encoding is applied exactly once.
+
+References: [Dataportalen registry API](https://docs.dataportal.se/registry/api/) and [EntryStore search fields](https://entrystore.org/kb/search/).
+
+#### A. Eligible dataset inventory
+
+Send `GET https://admin.dataportal.se/store/search` with these arguments:
+
+| Argument | Value |
+|---|---|
+| `type` | `solr` |
+| `query` | The exact expression below, joined with spaces. |
+| `limit` | `100` |
+| `offset` | `0`, then `100`, `200`, and so on. |
+| `sort` | `uri asc` |
+
+```text
+uri:https\://admin.dataportal.se/store/818/entry/*
+AND rdfType:http\://www.w3.org/ns/dcat#Dataset
+AND public:true
+AND -metadata.predicate.uri.23fc4665:http\://publications.europa.eu/resource/authority/access-right/NON_PUBLIC
+```
+
+The backslashes above belong to Solr syntax and must reach the server; they are not URL encoding. Context `818` is the verified Researchdata registry context. `public:true` selects readable metadata, not publicly downloadable research data. The final clause separately excludes dataset access rights `NON_PUBLIC`, while retaining records with unspecified rights. Do not add a distribution-existence filter.
+
+`23fc4665` is the first eight hexadecimal characters of MD5 of `http://purl.org/dc/terms/accessRights`, following EntryStore's predicate-field naming rule. Keep the predicate and field mapping together rather than treating this as an unexplained identifier.
+
+Read entries from `response.resource.children` and the reported total from `response.results`. Enumerate to an empty page, deduplicate by entry URI and reconcile unique results with the reported total and explicit catalog membership. A changed total, repeated page or unexplained discrepancy makes a full inventory incomplete; do not infer removals from it. In scoped `--limit N` mode, request at most `min(100, remaining)` entries per page and stop at the requested sample size instead.
+
+Do not add a `modified` date filter to the complete membership scan. Compare modification values locally so unchanged records remain visible and removals remain detectable. Do not pass `fl`, `cursorMark` or `recursive=dcat`; field projection was ineffective in the tested wrapper and the recursive JSON response omitted linked distribution metadata.
+
+#### B. Response fields and identities
+
+Use these namespace expansions:
+
+```text
+es:   http://entrystore.org/terms/
+dct:  http://purl.org/dc/terms/
+dcat: http://www.w3.org/ns/dcat#
+```
+
+For each entry, construct its entry URI from returned `contextId` and `entryId`, then read `info[entry_uri]`. Resolve the dataset URI from that node's `es:resource` value and select `metadata[dataset_uri]`; do not assume the first metadata node is the dataset.
+
+| Inventory value | Source field |
+|---|---|
+| Registry entry URI | `https://admin.dataportal.se/store/{contextId}/entry/{entryId}` |
+| Exact dataset URI | `info[entry_uri][es:resource][*].value` |
+| Registry modification timestamp | `info[entry_uri][dct:modified][*].value` |
+| Direct metadata URL | `info[entry_uri][es:metadata][*].value` |
+| Dataset modification values | `metadata[dataset_uri][dct:modified]` |
+| Titles and descriptions | `metadata[dataset_uri][dct:title]` and `[dct:description]` |
+| Access rights | `metadata[dataset_uri][dct:accessRights]` |
+| Landing pages | `metadata[dataset_uri][dcat:landingPage]` |
+| Distribution references | `metadata[dataset_uri][dcat:distribution]` |
+| Distribution count | Number of distinct distribution references on that dataset. |
+| Access/download URLs | `dcat:accessURL` and `dcat:downloadURL` on retrieved distribution nodes; preserve any supplied directly on the dataset too. |
+
+Preserve the RDF/JSON term arrays, including `type`, `value`, `lang` and `datatype`, and embedded blank nodes. Validate the required identity and registry timestamp fields; do not silently substitute the dataset timestamp or local current time. A distribution count is not a file count.
+
+#### C. Selected datasets and exclusion confirmation
+
+For `--dataset-uri`, append an exact quoted resource clause to query A. For example:
+
+```text
+AND resource:"https\://doi.org/10.48360/2f5f-2495"
+```
+
+Use the same search endpoint, headers and pagination arguments. Apply each supplied selector without scanning the entire inventory. Escape Solr special characters in source-supplied URIs before quoting them, including backslashes, quotation marks, colons and literal wildcards; then let `httpx` URL-encode the parameters.
+
+When a previously included dataset is missing from query A, use its stored direct metadata URL to inspect current access rights. If its registry entry must be rediscovered, repeat the selected-dataset query with only the final `NON_PUBLIC` exclusion clause removed. Do not apply the exclusion while trying to confirm that exclusion. A zero-result lookup alone does not prove deletion.
+
+#### D. Related RDF entities and cache revalidation
+
+Look up an uncached distribution, publisher, contact, service or other referenced entity through the same search endpoint:
+
+```text
+public:true AND resource:"https\://doi.org/10.48360/2f5f-2495#distribution"
+```
+
+Use `type=solr`, `limit=100`, `offset=0` and `sort=uri asc`, with the exact escaped URI substituted. Page additional results when present. Do not apply the dataset type, Researchdata context or dataset access-rights filters to related-entity lookups; referenced publishers and other entities can live outside that context. Retain distinct returned descriptions and their provenance rather than silently selecting the first match.
+
+Reuse metadata included in the lookup response and store its returned `es:metadata` URL. Subsequent revalidation uses `GET` on that exact metadata URL with `Accept: application/json`, for example:
+
+```text
+https://admin.dataportal.se/store/818/metadata/7118
+```
+
+Send `If-None-Match` when a cached ETag is available, otherwise `If-Modified-Since` when a cached Last-Modified value is available. Reuse the cached description on HTTP 304; replace it and its validators on HTTP 200. Without a validator, retrieve and compare content. A 404 or exhausted retry is an explicit failure outcome, not an empty successful entity.
+
+Follow dataset-owned metadata relationships and embedded blank-node references with URI deduplication. Vocabulary URIs go through the vocabulary cache; citations and unrelated navigation do not expand the dataset graph. No full-catalog SPARQL scan is needed for this request path.
+
+#### E. Authoritative catalog membership
+
+Send `GET https://admin.dataportal.se/store/818/metadata/9198` with `Accept: application/json` and no query parameters. Read distinct members from:
+
+```text
+response["https://researchdata.se/catalogue/"]
+        ["http://www.w3.org/ns/dcat#dataset"][*].value
+```
+
+Validate the catalog root and its `dcat:Catalog` type. This list includes `NON_PUBLIC` records, so its total must not be equated with the eligible Solr total. Use it to confirm actual membership loss; records still present but missing from eligible search require the exclusion check above, or leave the inventory incomplete if unexplained. Scoped runs skip this catalog-wide request and cannot remove records.
+
+Live verification on 21 October 2026 returned 5,143 eligible search results and 6,626 catalog members. Two consecutive 100-entry pages had no overlap; selected-dataset and distribution queries each returned the intended record; conditional retrieval of the example metadata URL returned HTTP 304. These are observed checks, not hard-coded counts or a fresh full-catalog acceptance run.
+
 ### RDF cache
 
 Use one `rdf-cache.json.gz` file, handled with Python's standard-library `json` and `gzip`. This is a reusable metadata lookup cache, not another database or service; no dedicated caching module or dependency is needed.
