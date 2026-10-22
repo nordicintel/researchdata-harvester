@@ -40,6 +40,9 @@ SKIP = {
     "related_identifiers",
     "relatedIdentifiers",
     "versions",
+    "previousVersion",
+    "previousVersions",
+    "versionHistory",
 }
 
 
@@ -180,7 +183,23 @@ def decode(response: httpx.Response) -> dict[str, Any]:
         if errors:
             raise ValueError("OAI metadata error: " + str(errors[0].attrib.get("code", "unknown")))
         documents = [json.loads(node.text) for node in root.iter() if local(node.tag) == "jsonLdString" and node.text]
-        return {"document": xml_json(root), "json_ld": documents, "links": []}
+        links = {
+            node.attrib["URI"]
+            for node in root.findall(".//{*}stdyDscr/{*}citation/{*}holdings")
+            if node.attrib.get("URI", "").startswith(("https://", "http://"))
+            and (node.text or "").strip().lower() == "landing page"
+        }
+        downloads = set()
+        for node in root.iter():
+            address = node.attrib.get("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}resource")
+            if address and node.tag in {
+                "{http://www.w3.org/ns/dcat#}landingPage",
+                "{http://www.w3.org/ns/dcat#}accessURL",
+            }:
+                links.add(address)
+            if address and node.tag == "{http://www.w3.org/ns/dcat#}downloadURL":
+                downloads.add(address)
+        return {"document": xml_json(root), "json_ld": documents, "links": sorted(links), "files": sorted(downloads)}
     parser = Landing()
     parser.feed(response.text)
     return {
@@ -367,6 +386,7 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
     try:
         data, resolved, media, transferred = await http.sample(url)
         acknowledgement = None
+        decompressed = len(data)
         if "html" in media and urlsplit(resolved).hostname in {"data.fieldsites.se", "data.icos-cp.eu"}:
             landing = Landing()
             landing.feed(data.decode("utf-8"))
@@ -374,6 +394,9 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
                 acknowledgement = urljoin(resolved, landing.acknowledgement)
                 data, resolved, media, extra = await http.sample(acknowledgement)
                 transferred += extra
+                decompressed += len(data)
+                if decompressed > config.verification_bytes:
+                    raise ValueError("decompressed_byte_limit")
                 if transferred > config.verification_bytes:
                     raise ValueError("transferred_byte_limit")
         format_name, columns, rows = await asyncio.to_thread(table_sample, data, filename or resolved, media, config)
@@ -393,7 +416,7 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
                     for index, name in enumerate(columns)
                 ],
                 "transferred_bytes": transferred,
-                "decompressed_bytes": len(data),
+                "decompressed_bytes": decompressed,
                 "license_acknowledgement_url": acknowledgement,
             },
         )
@@ -440,6 +463,7 @@ async def harvest(
         asserted.update(identity(term["value"]) for term in roots.get(uri, {}).get(predicate, []))
     pending.update("https://doi.org/" + value for value in asserted if re.fullmatch(r"10\.\d{4,9}/\S+", value))
     citation_candidates: dict[str, str] = {}
+    pending.update(link["landing_page"] for link in record.get("researchdata", []) if link.get("landing_page"))
     # SITES/ICOS older catalog rows expose only their repository-generated self-citation.
     # Confirm its complete text and persistent identifier against the repository before using files.
     for text in (term["value"] for term in roots.get(uri, {}).get(DCT + "description", [])):
@@ -479,7 +503,7 @@ async def harvest(
             decoder=decode,
             accept="application/ld+json, application/json, text/html;q=0.9",
             required=target.startswith(config.oai_url)
-            or (urlsplit(target).hostname == "researchdata.se" and "/export/" in target),
+            or urlsplit(target).hostname in {"researchdata.se", "www.researchdata.se", "api.researchdata.se"},
         )
         sources.append({"url": target, "outcome": entry.outcome, "stale": entry.stale, "reason": entry.error})
         if entry.outcome != "available":
@@ -506,6 +530,7 @@ async def harvest(
                 continue
         documents.append({"url": target, "metadata": document, "json": True})
         files.update(file_urls(document))
+        files.update(decoded.get("files", []))
         redirected = repository_url(source_url)
         if redirected != source_url:
             pending.add(redirected)
@@ -515,6 +540,7 @@ async def harvest(
             if "Dataset" in str(node.get("@type", "")):
                 pending.update(urls({key: node[key] for key in ("sameAs", "url") if key in node}, {"sameAs", "url"}))
         if urlsplit(source_url).hostname in {"researchdata.se", "www.researchdata.se"} and "/export/" not in source_url:
+            current_ids: set[str] = set()
             html_key = source_url + "#landing-html"
             html_entry = await cache.fetch(
                 html_key, http, source_url=source_url, decoder=decode, accept="text/html", required=True
@@ -527,6 +553,7 @@ async def harvest(
                     match = re.fullmatch(r"/catalogue/dataset/([^/]+)/([^/]+)/export/([^/]+)", urlsplit(link).path)
                     if match:
                         identifier = f"oai:researchdata.se:{match[1]}/{match[2]}"
+                        current_ids.add(identifier)
                         if match[3] in {"datacite", "dcat", "json_ld"}:
                             target_record = str(
                                 http.build_request(
@@ -539,7 +566,7 @@ async def harvest(
                         else:
                             pending.add(link)
                 files.update(file_urls(html_document["document"]))
-            ids = re.findall(r"oai:[^\s\"<>]+", json.dumps(document))
+            ids = sorted(current_ids) or re.findall(r"oai:[^\s\"<>]+", json.dumps(document))
             if not ids:
                 ids = [source_url]
             for identifier in sorted(set(ids)):
@@ -568,10 +595,15 @@ async def harvest(
             structured = [*structured, *document.get("json_ld", [])] if isinstance(structured, list) else []
             if any(key in document for key in ("@context", "$schema", "openapi")):
                 structured.append(document)
+        required_metadata = urlsplit(source_url).hostname in {
+            "researchdata.se",
+            "www.researchdata.se",
+            "api.researchdata.se",
+        }
         for item in structured:
             try:
                 if resolver is not None:
-                    resolved = await resolver.resolve(item, source_url=source_url, required=False)
+                    resolved = await resolver.resolve(item, source_url=source_url, required=required_metadata)
                 else:
                     async with SemanticResolver(
                         cache_path, http, updates_path, cache=cache, full=full
@@ -587,6 +619,8 @@ async def harvest(
                     )
                 documents.append({"url": source_url, "metadata": item, "properties": resolved.properties, "json": True})
             except (ValueError, CacheFetchError, JsonLdError) as error:
+                if required_metadata:
+                    raise
                 sources.append(
                     {"url": source_url, "outcome": "unavailable", "stale": False, "reason": type(error).__name__}
                 )
@@ -602,6 +636,7 @@ async def harvest(
                         "HTTP 504",
                     )
                 )
+    files.update(set().union(*(file_urls(document["metadata"]) for document in documents)))
     names: dict[str, str] = {}
     for document in documents:
         for node in objects(document["metadata"]):

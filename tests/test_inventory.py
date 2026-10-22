@@ -100,13 +100,22 @@ async def test_inventory_pages_and_registry_change_selection() -> None:
 
         previous = deepcopy(first["entries"])
         for entry in previous.values():
-            entry.update(outcome="eligible", retry=False)
+            entry.update(
+                outcome="eligible",
+                retry=False,
+                researchdata=[{"landing_page": "https://researchdata.example/current"}],
+                association_fingerprint=entry["fingerprint"],
+            )
         unchanged = await inventory(http, config, previous)
         assert unchanged["selected"] == []
         # Dataset dct:modified stays unchanged: only the separate registry signal advances.
         entries[1] = registry_entry(config, "b", "2026-10-23T00:00:00Z")
         changed = await inventory(http, config, previous)
         assert changed["selected"] == [members[1]]
+        assert changed["entries"][members[1]]["researchdata"] == previous[members[1]]["researchdata"]
+        entries[1]["metadata"][members[1]][NAMESPACES["dct"] + "title"][0]["value"] = "Changed identity evidence"
+        invalidated = await inventory(http, config, previous)
+        assert not invalidated["entries"][members[1]].get("researchdata")
         full = await inventory(http, config, previous, full=True)
         assert set(full["selected"]) == set(members)
 

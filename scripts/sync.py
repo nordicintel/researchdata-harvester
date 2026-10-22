@@ -66,6 +66,13 @@ async def fetch(
     gate = asyncio.Semaphore(config.concurrency)
     directory = work / stage
     directory.mkdir(parents=True, exist_ok=True)
+    completed = sorted((read_json(path).get("sequence", 0), path) for path in directory.glob("*.json"))
+    for _, path in completed:
+        cache.merge(read_json(path).get("cache_updates", {}))
+        cache.mark_saved()
+    # Consolidate replayed deltas before any record artifact can be replaced.
+    cache.save(saved_cache)
+    sequence = max((number for number, _ in completed), default=0)
     async with AsyncExitStack() as stack:
         if shared_http is None:
             http = Http(config)
@@ -83,6 +90,7 @@ async def fetch(
         )
 
         async def record(uri: str) -> None:
+            nonlocal sequence
             async with gate:
                 entry = plan["entries"][uri]
                 artifact = directory / (fingerprint(uri) + ".json")
@@ -90,7 +98,6 @@ async def fetch(
                 previous = read_json(artifact)
                 if previous and previous.get("key") == key and not previous["result"].get("retry"):
                     results[uri] = previous["result"]
-                    cache.merge(previous.get("cache_updates", {}))
                     logger.info("%s reused %s", stage, uri)
                     return
                 try:
@@ -112,8 +119,11 @@ async def fetch(
                             resolver=resolver,
                         )
                     results[uri] = result
-                    cache.save(saved_cache)
-                    write_json(artifact, {"key": key, "result": result})
+                    sequence += 1
+                    write_json(
+                        artifact, {"key": key, "result": result, "sequence": sequence, "cache_updates": cache.changes()}
+                    )
+                    cache.mark_saved()
                     logger.info(
                         "%s %d/%d %s outcome=%s",
                         stage,
@@ -129,6 +139,7 @@ async def fetch(
         async with asyncio.TaskGroup() as tasks:
             for uri in plan["selected"]:
                 tasks.create_task(record(uri))
+        cache.save(saved_cache)
         baseline_cache = read_cache(current / "rdf-cache.json.gz") if (current / "rdf-cache.json.gz").exists() else {}
         payload = {
             "implementation": plan["implementation"],

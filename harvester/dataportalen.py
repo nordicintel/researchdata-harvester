@@ -172,6 +172,9 @@ async def inventory(
             )
         )
         if changed:
+            if before.get("association_fingerprint") == item["fingerprint"]:
+                item["researchdata"] = before.get("researchdata", [])
+                item["association_fingerprint"] = item["fingerprint"]
             selected.append(uri)
         else:
             entries[uri] = {**before, "metadata": item["metadata"]}

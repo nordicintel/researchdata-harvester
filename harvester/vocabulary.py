@@ -415,6 +415,10 @@ class RdfCache:
             if entry != self._baseline.get(uri)
         }
 
+    def mark_saved(self) -> None:
+        """Advance the delta baseline after the caller atomically persists changes."""
+        self._baseline = self._entries.copy()
+
     def merge(self, *updates: Mapping[str, object]) -> None:
         """Merge worker updates atomically; differing updates for one URI fail."""
         pending = _ENTRIES.validate_python(self.changes())

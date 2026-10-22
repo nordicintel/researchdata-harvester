@@ -42,7 +42,7 @@ A new dataset must yield columns and an observation row. Public metadata, HTTP 2
 
 Verification supports CSV/TSV, flat JSON observations, XLSX, XLS, supported statistical files and Parquet, including gzip wrappers. Generic archives, documents, imagery, map layers and APIs with unknown selectors remain unresolved. At most 100 rows and 32 MiB of transferred/decompressed content are inspected per resource. Verification stops after the first successful resource establishes dataset eligibility; every remaining advertised resource stays in metadata with an explicit unverified outcome.
 
-Required-source failures prevent publication. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Verification does not establish redistribution rights.
+Required-source failures prevent publication. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Confirmed Researchdata associations stay in the inventory and are reused only while their supporting metadata fingerprint still matches. Verification does not establish redistribution rights.
 
 ## Scoped execution and recovery
 
@@ -55,7 +55,7 @@ uv run python -m scripts.sync --dataset-uri "https://doi.org/10.5878/d4bn-b702" 
 
 Use `--config config.local.toml` for an ignored complete alternative configuration. Configured paths resolve relative to the TOML file; CLI paths resolve relative to the working directory. `--report data/work/report.json` selects the report path.
 
-Reuse a work directory after interruption. Completed record artifacts are reusable only when inputs, configuration and implementation fingerprints agree. Pagination restarts. Use another work directory after a completed candidate build.
+Reuse a work directory after interruption. Completed record artifacts are reusable only when inputs, configuration and implementation fingerprints agree. Each artifact saves its new cache entries; the worker replays these in completion order after interruption and compresses the complete cache at stage boundaries. Pagination restarts. Use another work directory after a completed candidate build.
 
 ```sh
 uv run python -m scripts.sync --stage inventory --work-directory data/work/run

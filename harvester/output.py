@@ -202,6 +202,8 @@ def build(
                 if key in rd
             }
         )
+        if rd.get("researchdata"):
+            item["association_fingerprint"] = item["fingerprint"]
         if rd.get("outcome") == "eligible":
             row = deepcopy(rd.get("row")) or project(rd.get("documents", []), uri)
             row.update({key: rd[key] for key in ("resources", "researchdata", "sources") if key in rd})
