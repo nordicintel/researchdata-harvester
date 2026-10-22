@@ -523,3 +523,35 @@ async def test_consecutive_timeouts_restart_the_session_pause_and_then_defer_the
             await http.get("https://down.example/b")
         assert deferred.value.retry
         assert len(calls) == before, "a host past its failure limit is not contacted again"
+
+
+async def test_a_failing_redirect_target_is_cut_off_without_cutting_off_the_resolver() -> None:
+    from harvester.runtime import RecordError
+
+    publisher_calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal publisher_calls
+        if request.url.host == "doi.example":
+            target = "publisher.example" if request.url.path.startswith("/broken") else "healthy.example"
+            return httpx.Response(302, headers={"location": f"https://{target}{request.url.path}"})
+        if request.url.host == "publisher.example":
+            publisher_calls += 1
+            return httpx.Response(503)
+        return httpx.Response(200, json={})
+
+    config = Config(attempts=2, retry_initial_delay=0, session_reset_delay=0, source_failure_limit=3)
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True) as client,
+        Http(config, client) as http,
+    ):
+        for record in range(3):
+            with pytest.raises((httpx.HTTPStatusError, RecordError)):
+                await http.get(f"https://doi.example/broken/{record}")
+        assert http.source_failures == {"publisher.example": 3}
+        tripped = publisher_calls
+        with pytest.raises(RecordError) as deferred:
+            await http.get("https://doi.example/broken/later")
+        assert deferred.value.retry
+        assert publisher_calls == tripped, "a cut-off redirect target is not contacted again"
+        assert (await http.get("https://doi.example/working")).status_code == 200

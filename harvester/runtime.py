@@ -151,6 +151,16 @@ def transient(error: BaseException) -> bool:
     )
 
 
+def failing_host(error: BaseException | None, url: str) -> str:
+    """The host that produced an error, which after a redirect is not the requested one."""
+    if isinstance(error, httpx.HTTPError):
+        try:
+            return error.request.url.netloc.decode()
+        except RuntimeError:
+            pass
+    return urlsplit(url).netloc
+
+
 class Http:
     """One client whose normal requests and streamed samples share bounded retries."""
 
@@ -158,6 +168,7 @@ class Http:
         self.config = config
         self._owns_client = client is None
         self.source = client or self._new_client()
+        self.source.event_hooks["request"].append(self._refuse_unavailable)
         self._session_condition = asyncio.Condition()
         self._active = 0
         self._resetting = False
@@ -192,6 +203,10 @@ class Http:
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         return await self.request("GET", url, **kwargs)
 
+    async def _refuse_unavailable(self, request: httpx.Request) -> None:
+        if self.source_failures.get(request.url.netloc.decode(), 0) >= self.config.source_failure_limit:
+            raise RecordError("source_unavailable_after_recovery_attempts", url=str(request.url), retry=True)
+
     async def _reset_session(self) -> None:
         async with self._session_condition:
             await self._session_condition.wait_for(lambda: not self._resetting)
@@ -203,6 +218,7 @@ class Http:
                 if self._owns_client:
                     await self.source.aclose()
                     self.source = self._new_client()
+                    self.source.event_hooks["request"].append(self._refuse_unavailable)
                 self._reset_pending = False
                 logger.warning("HTTP session restarted after consecutive timeouts; source recovery pause follows")
             finally:
@@ -237,26 +253,28 @@ class Http:
                     yield
                 except httpx.HTTPError as error:
                     self.failures += 1
+                    host = failing_host(error, url)
                     if transient(error):
-                        self.source_failures[origin] = self.source_failures.get(origin, 0) + 1
-                        if isinstance(error, httpx.TimeoutException) and self.source_failures[origin] == 2:
+                        self.source_failures[host] = self.source_failures.get(host, 0) + 1
+                        if isinstance(error, httpx.TimeoutException) and self.source_failures[host] == 2:
                             self._reset_pending = True
-                        if self.source_failures[origin] == self.config.source_failure_limit:
+                        if self.source_failures[host] == self.config.source_failure_limit:
                             logger.error(
                                 "source unavailable host=%s consecutive_failures=%s; deferring remaining requests for retry",
-                                origin,
-                                self.source_failures[origin],
+                                host,
+                                self.source_failures[host],
                             )
                     else:
-                        self.source_failures.pop(origin, None)
-                        self._resume_at.pop(origin, None)
+                        self.source_failures.pop(host, None)
+                        self._resume_at.pop(host, None)
                     logger.warning(
-                        "request failed dataset=%s url=%s attempt=%s exception=%s host_failures=%s seconds=%.3f",
+                        "request failed dataset=%s url=%s host=%s attempt=%s exception=%s host_failures=%s seconds=%.3f",
                         dataset_context.get(),
                         safe_url(url),
+                        host,
                         number,
                         type(error).__name__,
-                        self.source_failures.get(origin, 0),
+                        self.source_failures.get(host, 0),
                         time.monotonic() - started,
                     )
                     raise
@@ -288,7 +306,7 @@ class Http:
                         except (ValueError, TypeError):
                             pass
             shared = copy(state)
-            shared.attempt_number = max(state.attempt_number, self.source_failures.get(urlsplit(url).netloc, 0))
+            shared.attempt_number = max(state.attempt_number, self.source_failures.get(failing_host(error, url), 0))
             pause = float(
                 wait_exponential(multiplier=self.config.retry_initial_delay, max=self.config.retry_max_delay)(shared)
             )
@@ -297,7 +315,7 @@ class Http:
         async def before_sleep(state: Any) -> None:
             pause = float(state.next_action.sleep)
             await self._reset_session()
-            origin = urlsplit(url).netloc
+            origin = failing_host(state.outcome.exception(), url)
             self._resume_at[origin] = max(self._resume_at.get(origin, 0), time.monotonic() + pause)
             if deadline is not None and pause >= deadline - time.monotonic():
                 logger.warning(
@@ -324,7 +342,7 @@ class Http:
             retry=retry_if_exception(
                 lambda error: (
                     transient(error)
-                    and self.source_failures.get(urlsplit(url).netloc, 0) < self.config.source_failure_limit
+                    and self.source_failures.get(failing_host(error, url), 0) < self.config.source_failure_limit
                 )
             ),
             before_sleep=before_sleep,
