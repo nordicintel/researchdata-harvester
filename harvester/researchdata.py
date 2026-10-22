@@ -439,7 +439,9 @@ async def harvest(
     for predicate in {DCT + "identifier", *IDENTITY_PREDICATES}:
         asserted.update(identity(term["value"]) for term in roots.get(uri, {}).get(predicate, []))
     pending.update("https://doi.org/" + value for value in asserted if re.fullmatch(r"10\.\d{4,9}/\S+", value))
-    # A description citation needs matching identity evidence, not just a dataset label.
+    citation_candidates: dict[str, str] = {}
+    # SITES/ICOS older catalog rows expose only their repository-generated self-citation.
+    # Confirm its complete text and persistent identifier against the repository before using files.
     for text in (term["value"] for term in roots.get(uri, {}).get(DCT + "description", [])):
         for line in text.splitlines():
             if "[Data set]" in line or "[Dataset]" in line:
@@ -448,6 +450,11 @@ async def harvest(
                     for url in re.findall(r"https?://[^\s<>]+", line)
                     if identity(url.rstrip(".,)")) in asserted
                 )
+                for address in re.findall(r"https?://[^\s<>]+", line):
+                    address = address.rstrip(".,)")
+                    if re.fullmatch(r"https?://hdl\.handle\.net/11676(?:\.1)?/[^/]+", address):
+                        citation_candidates[address] = line.strip()
+                        pending.add(address)
     files = set().union(*(file_urls(doc["metadata"]) for doc in documents))
     for term in roots.get(uri, {}).get(DCT + "identifier", []):
         if term["value"].startswith(("https://doi.org/", "http://doi.org/")):
@@ -482,6 +489,21 @@ async def harvest(
         decoded = cast(dict[str, Any], entry.data)
         source_url = entry.resolved_url or target
         document = decoded.get("document", {})
+        if original in citation_candidates:
+            citation = document.get("references", {}).get("citationString", "") if isinstance(document, dict) else ""
+            pid = document.get("pid") if isinstance(document, dict) else None
+            if " ".join(citation.split()) != " ".join(citation_candidates[original].split()) or pid != urlsplit(
+                original
+            ).path.lstrip("/"):
+                sources.append(
+                    {
+                        "url": original,
+                        "outcome": "unresolved",
+                        "stale": False,
+                        "reason": "Unconfirmed description-linked dataset identity",
+                    }
+                )
+                continue
         documents.append({"url": target, "metadata": document, "json": True})
         files.update(file_urls(document))
         redirected = repository_url(source_url)

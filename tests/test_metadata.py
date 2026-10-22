@@ -503,10 +503,21 @@ async def test_harvest_normalizes_own_doi_without_following_cited_datasets(tmp_p
             ],
         }
     }
+    citation = "Station (2021). Water [Data set]. SITES. https://hdl.handle.net/11676.1/example"
     requested = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requested.append(str(request.url))
+        if request.url.host == "hdl.handle.net":
+            return httpx.Response(
+                200,
+                json={
+                    "pid": "11676.1/example",
+                    "references": {"citationString": citation},
+                    "fileName": "water.csv",
+                    "accessUrl": "https://data.example/a.csv",
+                },
+            )
         if request.url.path.endswith(".csv"):
             return httpx.Response(200, text="station,temperature\nA,12\n", headers={"Content-Type": "text/csv"})
         return httpx.Response(200, json={"name": "Source metadata"})
@@ -532,3 +543,25 @@ async def test_harvest_normalizes_own_doi_without_following_cited_datasets(tmp_p
     assert result["outcome"] == "eligible"
     assert len(result["resources"]) == 2
     assert result["resources"][1]["verification"] is None
+
+    graph = {uri: {"http://purl.org/dc/terms/description": [{"type": "literal", "value": citation}]}}
+    requested.clear()
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client,
+        Http(Config(), client=client) as http,
+    ):
+        result = await harvest(
+            http,
+            Config(),
+            {
+                "dataset_uri": uri,
+                "metadata_url": uri,
+                "metadata": graph,
+                "documents": [{"url": uri, "metadata": graph}],
+            },
+            RdfCache(),
+            tmp_path / "cache.gz",
+            tmp_path / "updates.gz",
+        )
+    assert result["outcome"] == "eligible"
+    assert requested == ["https://hdl.handle.net/11676.1/example", "https://data.example/a.csv"]
