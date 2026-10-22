@@ -11,11 +11,11 @@ from typing import Any
 import duckdb
 import httpx
 import pytest
+
 from harvester.output import build, validate
 from harvester.researchdata import verify
-from scripts.publish import publish
-
 from harvester.runtime import Config, Http
+from scripts.publish import publish
 
 
 async def test_verification_requires_observations_and_keeps_only_bounded_evidence() -> None:

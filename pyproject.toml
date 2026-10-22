@@ -53,6 +53,9 @@ extend-exclude = [".work"]
 select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
 ignore = ["E501"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["harvester", "scripts"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
