@@ -20,6 +20,9 @@ from urllib.parse import urljoin, urlsplit
 import duckdb
 import httpx
 from defusedxml.ElementTree import fromstring
+from openpyxl.utils.exceptions import InvalidFileException
+from pyreadstat import ReadstatError
+from xlrd.biffh import XLRDError
 
 from harvester.dataportalen import DCT
 from harvester.runtime import Config, Http, safe_url
@@ -221,8 +224,13 @@ def file_urls(document: Any) -> set[str]:
 def table_sample(data: bytes, url: str, media: str, config: Config) -> tuple[str, list[str], list[list[Any]]]:
     suffix = Path(urlsplit(url).path.removesuffix(".gz")).suffix.lower()
     count = config.verification_rows
+    if suffix == ".xls" and not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return table_sample(data, "advertised-table.tsv", "text/tab-separated-values", config)
     if suffix in {".csv", ".tsv"} or media in {"text/csv", "text/tab-separated-values"}:
-        text = data.decode("utf-8-sig")
+        try:
+            text = data.decode("utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("cp1252")
         if text.lstrip().startswith(("<", "{")):
             raise ValueError("Response is not a delimited observation table")
         if "\n####\n" in text.replace("\r\n", "\n"):
@@ -342,7 +350,7 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
         "checked_at": now(),
         "verification": None,
     }
-    if filename and Path(filename).suffix.lower() in {
+    if Path(filename or urlsplit(url).path).suffix.lower() in {
         ".zip",
         ".tar",
         ".rar",
@@ -395,7 +403,16 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
             if isinstance(error, httpx.HTTPStatusError)
             else type(error).__name__,
         )
-    except (ValueError, UnicodeError, csv.Error, zipfile.BadZipFile) as error:
+    except (
+        ValueError,
+        UnicodeError,
+        csv.Error,
+        zipfile.BadZipFile,
+        XLRDError,
+        InvalidFileException,
+        ReadstatError,
+        duckdb.Error,
+    ) as error:
         result["reason"] = str(error)
     logger.debug("verification url=%s outcome=%s reason=%s", safe_url(url), result["outcome"], result["reason"])
     return result
