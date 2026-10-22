@@ -11,5 +11,5 @@ read_timeout = 30
 attempts = 3
 operation_deadline = 90
 verification_rows = 100
-verification_bytes = 33554432
+verification_bytes = 8388608
 page_size = 100

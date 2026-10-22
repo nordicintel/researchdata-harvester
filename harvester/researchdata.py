@@ -32,6 +32,7 @@ from harvester.runtime import Config, Http, RecordError, safe_url
 from harvester.vocabulary import IDENTITY_PREDICATES, CacheFetchError, RdfCache, SemanticResolver
 
 logger = logging.getLogger(__name__)
+LICENCE_LANDING_HOSTS = {"data.fieldsites.se", "data.icos-cp.eu"}
 FILE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".sav", ".dta", ".sas7bdat", ".parquet"}
 SKIP = {
     "citation",
@@ -248,6 +249,17 @@ def file_urls(document: Any) -> set[str]:
     return {value for value in result if value.startswith(("https://", "http://"))}
 
 
+def parseable(name: str, media: str) -> bool:
+    """Whether table_sample has a reader for a resource with this name and media type."""
+    suffix = Path(urlsplit(name).path.removesuffix(".gz")).suffix.lower()
+    return (
+        suffix in FILE_SUFFIXES
+        or suffix == ".json"
+        or media in {"text/csv", "text/tab-separated-values"}
+        or "json" in media
+    )
+
+
 def table_sample(data: bytes, url: str, media: str, config: Config) -> tuple[str, list[str], list[list[Any]]]:
     suffix = Path(urlsplit(url).path.removesuffix(".gz")).suffix.lower()
     count = config.verification_rows
@@ -390,18 +402,24 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
     }:
         result["reason"] = "Unsupported archive, document or geospatial resource"
         return result
+
+    def readable(advertised: str | None, resolved: str, media: str) -> bool:
+        if "html" in media and urlsplit(resolved).hostname in LICENCE_LANDING_HOSTS:
+            return True
+        return parseable(filename or advertised or resolved, media)
+
     try:
-        data, resolved, media, transferred, advertised_filename = await http.sample(url)
+        data, resolved, media, transferred, advertised_filename = await http.sample(url, readable)
         filename = filename or advertised_filename
         result["filename"] = filename or result["filename"]
         acknowledgement = None
         decompressed = len(data)
-        if "html" in media and urlsplit(resolved).hostname in {"data.fieldsites.se", "data.icos-cp.eu"}:
+        if "html" in media and urlsplit(resolved).hostname in LICENCE_LANDING_HOSTS:
             landing = Landing()
             landing.feed(data.decode("utf-8"))
             if landing.acknowledgement:
                 acknowledgement = urljoin(resolved, landing.acknowledgement)
-                data, resolved, media, extra, advertised_filename = await http.sample(acknowledgement)
+                data, resolved, media, extra, advertised_filename = await http.sample(acknowledgement, readable)
                 filename = filename or advertised_filename
                 result["filename"] = filename or result["filename"]
                 transferred += extra

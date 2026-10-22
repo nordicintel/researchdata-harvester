@@ -11,7 +11,7 @@ import tempfile
 import time
 import tomllib
 import zlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from copy import copy
@@ -99,7 +99,7 @@ class Config(BaseModel):
     source_failure_limit: int = Field(default=6, ge=3, le=100)
     session_reset_delay: float = Field(default=60, ge=0, le=600)
     verification_rows: int = Field(default=100, ge=1, le=100)
-    verification_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    verification_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
     page_size: int = Field(default=100, ge=1, le=100)
 
     @classmethod
@@ -384,8 +384,14 @@ class Http:
             raise httpx.ReadTimeout("HTTP operation deadline exhausted", request=httpx.Request(method, url)) from error
         raise RuntimeError("Retry loop produced no response")
 
-    async def sample(self, url: str) -> tuple[bytes, str, str, int, str | None]:
-        """Read bounded content, stopping text resources after enough complete lines."""
+    async def sample(
+        self, url: str, readable: Callable[[str | None, str, str], bool] | None = None
+    ) -> tuple[bytes, str, str, int, str | None]:
+        """Read bounded content, stopping text resources after enough complete lines.
+
+        ``readable(filename, resolved_url, media_type)`` rejects a response from its headers,
+        before any of the body is transferred.
+        """
         deadline = time.monotonic() + self.config.operation_deadline
         try:
             async with asyncio.timeout(self.config.operation_deadline):
@@ -402,6 +408,8 @@ class Http:
                                 disposition = Message()
                                 disposition["Content-Disposition"] = response.headers.get("content-disposition", "")
                                 filename = disposition.get_filename()
+                                if readable and not readable(filename, str(response.url), content_type):
+                                    raise ValueError("Unsupported or inconclusive tabular format")
                                 is_text = (
                                     any(
                                         ext in response.headers.get("content-disposition", "").lower()

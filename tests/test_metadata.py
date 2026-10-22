@@ -686,3 +686,29 @@ async def test_harvest_normalizes_own_doi_without_following_cited_datasets(tmp_p
         )
     assert result["outcome"] == "eligible"
     assert requested == ["https://hdl.handle.net/11676.1/example", "https://data.example/a.csv"]
+
+
+async def test_verification_rejects_an_unparseable_download_before_reading_its_body() -> None:
+    from harvester.researchdata import verify
+    from harvester.runtime import Config, Http
+
+    class Archive(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            raise AssertionError("An archive body must not be transferred for verification")
+            yield b""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/zip", "content-disposition": 'attachment; filename="data.zip"'},
+            stream=Archive(),
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client,
+        Http(Config(attempts=1), client) as http,
+    ):
+        result = await verify(http, "https://zenodo.org/api/records/1/files/data.zip/content", http.config)
+    assert result["outcome"] == "unresolved"
+    assert result["reason"] == "Unsupported or inconclusive tabular format"
+    assert result["verification"] is None
