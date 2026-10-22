@@ -6,6 +6,11 @@ on:
       - 'data/**'
   pull_request:
   workflow_dispatch:
+    inputs:
+      network_diagnostics:
+        description: Probe source connectivity from this runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +25,33 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
+      - name: Diagnose source connectivity
+        if: inputs.network_diagnostics == true
+        timeout-minutes: 2
+        run: |
+          uv run python - <<'PY'
+          import asyncio
+          import socket
+          import httpx
+          from harvester.runtime import Config, Http
+          from harvester.dataportalen import escape
+
+          async def main():
+              host = "admin.dataportal.se"
+              print("DNS", sorted({item[4][0] for item in socket.getaddrinfo(host, 443)}), flush=True)
+              config = Config(attempts=1, connect_timeout=5, read_timeout=5, operation_deadline=8)
+              params = {"type": "solr", "limit": 1, "offset": 0,
+                  "query": 'public:true AND resource:"' + escape("https://doi.org/10.5878/c80b-z312#distribution") + '"'}
+              for mode in ("default", "ipv4"):
+                  transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0") if mode == "ipv4" else None
+                  async with httpx.AsyncClient(transport=transport) as raw, Http(config, raw) as client:
+                      try:
+                          response = await client.get(config.search_url, params=params)
+                          print(mode, "status", response.status_code, "bytes", len(response.content), flush=True)
+                      except httpx.HTTPError as error:
+                          print(mode, type(error).__name__, flush=True)
+          asyncio.run(main())
+          PY
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
