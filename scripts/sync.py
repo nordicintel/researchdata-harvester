@@ -279,6 +279,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     code_hash = implementation()
     with output.lock(current):
         output.recover(current)
+        if args.stage == "all":
+            output.clear_completed_candidate(work / "candidate", current, work)
         if current.exists() and any(current.iterdir()) and not (current / "manifest.json").exists():
             raise ValueError(
                 "Nonempty destination has no manifest; choose an empty directory or a valid current generation"
@@ -391,6 +393,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         write_json(args.report or work / "report.json", report)
         if args.stage == "all":
             output.replace(candidate, current)
+            output.clear_completed_candidate(candidate, current, work)
         return report
 
 

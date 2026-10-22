@@ -479,10 +479,10 @@ async def test_complete_sync_retries_only_failed_datasets(tmp_path: Path, monkey
         assert first["newly_deferred"] == 1
         assert first["retry_required"] == 1
         failing = False
-        second = await sync.run(args("retry"))
+        second = await sync.run(args("first"))
         assert second["selected"] == 1
         assert second["retry_required"] == 0
         assert second["counts"] == {"datasets": 2, "dataportalen": 2}
-        unchanged = await sync.run(args("unchanged"))
+        unchanged = await sync.run(args("first"))
         assert unchanged["outcome"] == "unchanged"
         assert data_requests == [members[0] + ".csv", members[1] + ".csv"]

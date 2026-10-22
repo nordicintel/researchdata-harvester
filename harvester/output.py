@@ -411,3 +411,15 @@ def replace(candidate: Path, destination: Path) -> None:
     validate(destination)
     if previous.exists():
         shutil.rmtree(previous)
+
+
+def clear_completed_candidate(candidate: Path, destination: Path, work: Path) -> None:
+    """Remove only a work-owned candidate already installed as current data."""
+    if not candidate.exists():
+        return
+    target = candidate.resolve()
+    if target.parent != work.resolve() or candidate.is_symlink() or candidate.is_junction():
+        raise ValueError("Candidate cleanup target is outside its work directory")
+    if not (destination / "manifest.json").exists() or validate(candidate) != validate(destination):
+        raise ValueError("Candidate is not the installed generation; inspect it or use a fresh work directory")
+    shutil.rmtree(target)
