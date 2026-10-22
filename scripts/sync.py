@@ -112,7 +112,7 @@ async def fetch(
                 artifact = directory / (fingerprint(uri) + ".json")
                 key = record_key(plan, entry)
                 previous = read_json(artifact)
-                if previous:
+                if previous and previous.get("key") == key:
                     validate_result(previous.get("result"), stage, uri)
                 if (
                     previous

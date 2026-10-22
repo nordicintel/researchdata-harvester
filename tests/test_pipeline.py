@@ -231,6 +231,20 @@ async def test_fetch_contains_expected_failures_and_reuses_completed_records(tmp
     result = await sync.fetch("dataportalen", plan, Config(), tmp_path / "work", tmp_path / "current")
     assert calls == ["good", "bad", "bad"]
     assert result["outcomes"] == {"succeeded": 2}
+    from harvester.runtime import fingerprint, write_json
+
+    write_json(
+        tmp_path / "work/dataportalen" / (fingerprint("good") + ".json"),
+        {
+            "key": "obsolete-implementation",
+            "result": {},
+            "cache_updates": {},
+            "sequence": 0,
+        },
+    )
+    refreshed = await sync.fetch("dataportalen", plan, Config(), tmp_path / "work", tmp_path / "current")
+    assert refreshed["outcomes"] == {"succeeded": 2}
+    assert calls == ["good", "bad", "bad", "good"]
 
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise KeyError("programming defect")

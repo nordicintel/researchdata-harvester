@@ -728,8 +728,9 @@ class SemanticResolver:
 
     The paths must differ. The published cache is read-only; updates_path is a
     run-specific gzip JSON artifact for RdfCache.merge() in the build job. No
-    artifact is saved after an exception, cancellation, or failed resolve(), even
-    if the caller catches that error. Await all resolve calls before leaving.
+    artifact is saved after an uncaught exception, cancellation, or failed
+    resolve(required=True). A caught expected failure from resolve(required=False)
+    preserves updates from other completed documents. Await all calls before leaving.
     The caller owns the shared client and retry policy. concurrency bounds this
     resolver's simultaneous HTTP lookups. Remote contexts are required; semantic
     definitions are optional and their failures are returned with original URIs.
