@@ -39,6 +39,8 @@ jobs:
             data/work/action/researchdata.json
             data/work/action/researchdata-cache.json.gz
             data/work/action/researchdata/
+            data/work/action/researchdata-report.json
+            data/work/action/researchdata-run.log
           retention-days: 1
           overwrite: true
           if-no-files-found: warn

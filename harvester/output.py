@@ -246,12 +246,13 @@ def build(
             row["availability"] = "unavailable"
             latest = {resource["url"]: resource for resource in rd.get("resources", [])}
             for resource in row["resources"]:
-                update = latest.get(resource["url"], {})
+                update = latest.pop(resource["url"], {})
                 evidence = resource["verification"]
                 resource.update(update)
                 resource["verification"] = evidence
                 resource["outcome"] = "unavailable"
                 resource["reason"] = update.get("reason", rd.get("reason", "Refresh unavailable"))
+            row["resources"].extend(deepcopy(list(latest.values())))
             for source in row.get("sources", []):
                 source.update(stale=True, outcome="unavailable")
             rows["datasets"][uri] = row

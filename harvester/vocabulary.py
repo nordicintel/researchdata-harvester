@@ -106,7 +106,7 @@ from referencing._core import Resolver
 from referencing.exceptions import Unresolvable
 from referencing.jsonschema import DRAFT202012
 
-from harvester.runtime import RecordError, transient
+from harvester.runtime import Http, RecordError, transient
 
 # ------------------------------------------------------------------------------
 # Namespaces and normalization projections
@@ -327,7 +327,7 @@ class RdfCache:
     async def fetch(
         self,
         uri: str,
-        client: httpx.AsyncClient,
+        client: httpx.AsyncClient | Http,
         *,
         kind: Literal["vocabulary", "entity"] = "entity",
         source_url: str | None = None,
@@ -396,7 +396,9 @@ class RdfCache:
                     logger.debug("RDF cache refresh: HTTP %s", response.status_code)
                 except (httpx.HTTPError, ValueError, RecordError) as error:
                     reason = (
-                        f"HTTP {error.response.status_code}"
+                        str(error)
+                        if isinstance(error, RecordError)
+                        else f"HTTP {error.response.status_code}"
                         if isinstance(error, httpx.HTTPStatusError)
                         else type(error).__name__
                     )
@@ -740,7 +742,7 @@ class SemanticResolver:
     def __init__(
         self,
         cache_path: Path,
-        client: httpx.AsyncClient,
+        client: httpx.AsyncClient | Http,
         updates_path: Path,
         *,
         full: bool = False,

@@ -5,6 +5,7 @@
 import asyncio
 import json
 import subprocess
+import time
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from pathlib import Path
@@ -325,8 +326,8 @@ async def test_http_retry_exhaustion_is_record_local(tmp_path: Path, monkeypatch
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client, Http(config, client) as http:
         retry = http.retry
 
-        def immediate_retry() -> Any:
-            policy = retry()
+        def immediate_retry(*args: Any) -> Any:
+            policy = retry(*args)
             policy.wait = wait_none()
             return policy
 
@@ -486,3 +487,39 @@ async def test_complete_sync_retries_only_failed_datasets(tmp_path: Path, monkey
         unchanged = await sync.run(args("first"))
         assert unchanged["outcome"] == "unchanged"
         assert data_requests == [members[0] + ".csv", members[1] + ".csv"]
+
+
+async def test_consecutive_timeouts_restart_the_session_pause_and_then_defer_the_host(monkeypatch: Any) -> None:
+    from harvester.runtime import RecordError
+
+    calls: list[float] = []
+    clients: list[httpx.AsyncClient] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(time.monotonic())
+        raise httpx.ConnectTimeout("unreachable", request=request)
+
+    def new_client(self: Http) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(Http, "_new_client", new_client)
+    config = Config(
+        attempts=3,
+        retry_initial_delay=0,
+        session_reset_delay=0.3,
+        source_failure_limit=3,
+        operation_deadline=5,
+    )
+    async with Http(config) as http:
+        with pytest.raises(httpx.ConnectTimeout):
+            await http.get("https://down.example/a")
+        assert len(clients) == 2, "the session is replaced after the second consecutive timeout"
+        assert clients[0].is_closed
+        assert calls[2] - calls[1] >= 0.3, "the host pauses for the session reset delay before retrying"
+        before = len(calls)
+        with pytest.raises(RecordError) as deferred:
+            await http.get("https://down.example/b")
+        assert deferred.value.retry
+        assert len(calls) == before, "a host past its failure limit is not contacted again"

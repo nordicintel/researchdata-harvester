@@ -50,6 +50,8 @@ SKIP = {
 
 def retry_reason(reason: str | None) -> bool:
     return reason in {
+        "source_unavailable_after_recovery_attempts",
+        "source_backoff_exceeds_operation_deadline",
         "HTTP 429",
         "HTTP 500",
         "HTTP 502",
@@ -261,7 +263,7 @@ def table_sample(data: bytes, url: str, media: str, config: Config) -> tuple[str
         if "\n####\n" in text.replace("\r\n", "\n"):
             text = text.replace("\r\n", "\n").split("\n####\n", 1)[1]
         dialect = csv.Sniffer().sniff("\n".join(text.splitlines()[:6]), delimiters=",;\t|")
-        reader = csv.reader(io.StringIO(text), dialect)
+        reader = csv.reader(io.StringIO(text), dialect, strict=True)
         header = next(reader, [])
         rows = []
         for row in reader:
@@ -389,7 +391,9 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
         result["reason"] = "Unsupported archive, document or geospatial resource"
         return result
     try:
-        data, resolved, media, transferred = await http.sample(url)
+        data, resolved, media, transferred, advertised_filename = await http.sample(url)
+        filename = filename or advertised_filename
+        result["filename"] = filename or result["filename"]
         acknowledgement = None
         decompressed = len(data)
         if "html" in media and urlsplit(resolved).hostname in {"data.fieldsites.se", "data.icos-cp.eu"}:
@@ -397,7 +401,9 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
             landing.feed(data.decode("utf-8"))
             if landing.acknowledgement:
                 acknowledgement = urljoin(resolved, landing.acknowledgement)
-                data, resolved, media, extra = await http.sample(acknowledgement)
+                data, resolved, media, extra, advertised_filename = await http.sample(acknowledgement)
+                filename = filename or advertised_filename
+                result["filename"] = filename or result["filename"]
                 transferred += extra
                 decompressed += len(data)
                 if decompressed > config.verification_bytes:
@@ -425,6 +431,8 @@ async def verify(http: Http, url: str, config: Config, *, filename: str | None =
                 "license_acknowledgement_url": acknowledgement,
             },
         )
+    except RecordError as error:
+        result.update(outcome="unavailable" if error.retry else "unresolved", reason=str(error))
     except httpx.HTTPError as error:
         result.update(
             outcome="unavailable",

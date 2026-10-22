@@ -10,7 +10,7 @@ import os
 import subprocess
 import time
 from collections import Counter
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,6 +22,7 @@ from harvester.runtime import (
     Config,
     Http,
     RecordError,
+    dataset_context,
     fingerprint,
     read_json,
     record_key,
@@ -108,6 +109,7 @@ async def fetch(
         async def record(uri: str) -> None:
             nonlocal sequence, published
             async with gate:
+                dataset_context.set(uri)
                 entry = plan["entries"][uri]
                 artifact = directory / (fingerprint(uri) + ".json")
                 key = record_key(plan, entry)
@@ -197,7 +199,7 @@ async def fetch(
                         "reason": reason,
                         "retry": retry,
                     }
-                    logger.warning("%s dataset=%s reason=%s retry=%s", stage, uri, reason, retry)
+                    logger.warning("%s dataset=%s url=%s reason=%s retry=%s", stage, uri, url, reason, retry)
                 except Exception:
                     logger.exception("%s failed dataset=%s", stage, uri)
                     raise
@@ -217,9 +219,46 @@ async def fetch(
                 cache.mark_saved()
                 logger.info("%s %d/%d %s status=%s", stage, len(results), len(plan["selected"]), uri, result["status"])
 
-        async with asyncio.TaskGroup() as tasks:
-            for uri in plan["selected"]:
-                tasks.create_task(record(uri))
+        def progress(complete: bool) -> dict[str, Any]:
+            return {
+                "stage": stage,
+                "complete": complete,
+                "selected": len(plan["selected"]),
+                "completed": len(results),
+                "pending": len(plan["selected"]) - len(results),
+                "outcomes": dict(Counter(item["status"] for item in results.values())),
+                "requests": http.requests,
+                "failed_requests": http.failures,
+                "elapsed_seconds": time.monotonic() - http.started,
+                "failures": [item for item in results.values() if item["status"] == "failed"],
+            }
+
+        async def heartbeat() -> None:
+            while True:
+                report = progress(False)
+                write_json(work / (stage + "-report.json"), report)
+                logger.info(
+                    "%s progress completed=%s/%s pending=%s requests=%s failed_requests=%s seconds=%.1f",
+                    stage,
+                    report["completed"],
+                    report["selected"],
+                    report["pending"],
+                    http.requests,
+                    http.failures,
+                    report["elapsed_seconds"],
+                )
+                await asyncio.sleep(30)
+
+        pulse = asyncio.create_task(heartbeat())
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                for uri in plan["selected"]:
+                    tasks.create_task(record(uri))
+        finally:
+            pulse.cancel()
+            with suppress(asyncio.CancelledError):
+                await pulse
+            write_json(work / (stage + "-report.json"), progress(len(results) == len(plan["selected"])))
         cache.save(saved_cache)
         baseline_cache = read_cache(current / "rdf-cache.json.gz") if (current / "rdf-cache.json.gz").exists() else {}
         payload = {
@@ -399,7 +438,18 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     args = parser().parse_args()
-    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    work = args.work_directory.resolve()
+    work.mkdir(parents=True, exist_ok=True)
+    console = logging.StreamHandler()
+    console.setLevel(args.log_level)
+    debug_log = logging.FileHandler(work / (args.stage + "-run.log"), encoding="utf-8")
+    debug_log.setLevel(logging.DEBUG)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        handlers=[console, debug_log],
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     try:

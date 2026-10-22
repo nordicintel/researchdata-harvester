@@ -5,6 +5,8 @@
 import asyncio
 import gzip
 import json
+from collections.abc import AsyncIterator
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,6 +25,91 @@ from harvester.vocabulary import (
 )
 
 SCHEMA = Path(__file__).parents[1] / "harvester" / "schema.sql"
+
+
+async def test_verification_rejects_a_csv_sample_ending_inside_a_quoted_record() -> None:
+    from harvester.researchdata import verify
+    from harvester.runtime import Config, Http
+
+    class IncompleteCsv(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"measurement,notes\n"
+            yield b'1,"continued\n' + b"continued,notes\n" * 104
+            raise AssertionError("The sample ended before a complete observation")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/csv"}, stream=IncompleteCsv())
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client,
+        Http(Config(attempts=1), client) as http,
+    ):
+        result = await verify(http, "https://data.example/table.csv", http.config)
+    assert result["outcome"] == "unresolved"
+    assert result["verification"] is None
+    assert result["reason"] == "unexpected end of data"
+
+
+async def test_verification_accepts_a_complete_quoted_multiline_csv_record() -> None:
+    from harvester.researchdata import verify
+    from harvester.runtime import Config, Http
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'measurement,notes\n1,"first line\nsecond line"\n',
+            headers={"content-type": "text/csv"},
+        )
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client,
+        Http(Config(attempts=1), client) as http,
+    ):
+        result = await verify(http, "https://data.example/table.csv", http.config)
+    assert result["outcome"] == "verified"
+    assert result["verification"]["sampled_rows"] == 1
+    assert [column["name"] for column in result["verification"]["columns"]] == ["measurement", "notes"]
+
+
+@pytest.mark.parametrize("outcome", ["unavailable", "unresolved"])
+def test_stale_publication_keeps_failed_replacement_resources(tmp_path: Path, outcome: str) -> None:
+    from test_pipeline import candidate_inputs
+
+    from harvester.output import build, load_rows, validate
+
+    plan, dataportalen, researchdata = candidate_inputs()
+    current = tmp_path / "current"
+    build(tmp_path / "absent", current, plan, dataportalen, researchdata, [])
+    uri = plan["selected"][0]
+    original = load_rows(current, "datasets", validate(current))[uri]["resources"][0]
+    retained = deepcopy(original)
+    retained.update(outcome="unavailable", reason="HTTP 504", verification=None)
+    replacement = {
+        **deepcopy(retained),
+        "url": "https://data.example/replacement.csv",
+        "filename": "replacement.csv",
+        "reason": "HTTP 503",
+    }
+    plan["selected"] = [uri]
+    researchdata[uri] = {
+        "status": "succeeded",
+        "outcome": outcome,
+        "retry": True,
+        "reason": "No verified tabular resource",
+        "resources": [retained, replacement],
+    }
+    candidate = tmp_path / "candidate"
+    build(current, candidate, plan, dataportalen, researchdata, [])
+    row = load_rows(candidate, "datasets", validate(candidate))[uri]
+    resources = {resource["url"]: resource for resource in row["resources"]}
+    assert row["availability"] == "unavailable"
+    assert set(resources) == {original["url"], replacement["url"]}
+    assert resources[original["url"]]["verification"] == original["verification"]
+    assert resources[original["url"]]["reason"] == "HTTP 504"
+    assert resources[replacement["url"]]["verification"] is None
+    assert resources[replacement["url"]]["reason"] == "HTTP 503"
+    assert resources[replacement["url"]]["outcome"] == "unavailable"
+    assert replacement["verification"] is None
 
 
 def test_vocabulary_targets_the_sql_contract() -> None:

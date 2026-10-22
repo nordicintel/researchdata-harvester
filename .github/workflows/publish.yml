@@ -48,7 +48,9 @@ jobs:
         if: always()
         with:
           name: harvest-report
-          path: data/work/action/report.json
+          path: |
+            data/work/action/report.json
+            data/work/action/build-run.log
           retention-days: 1
           overwrite: true
           if-no-files-found: warn

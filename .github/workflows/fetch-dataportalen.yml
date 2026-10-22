@@ -39,6 +39,8 @@ jobs:
             data/work/action/dataportalen.json
             data/work/action/dataportalen-cache.json.gz
             data/work/action/dataportalen/
+            data/work/action/dataportalen-report.json
+            data/work/action/dataportalen-run.log
           retention-days: 1
           overwrite: true
           if-no-files-found: warn

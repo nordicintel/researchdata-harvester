@@ -36,9 +36,12 @@ jobs:
           if [ "$FULL" = "true" ]; then args+=(--full); fi
           uv run python -m scripts.sync --stage inventory --work-directory data/work/action "${args[@]}"
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: inventory
-          path: data/work/action/inventory.json
+          path: |
+            data/work/action/inventory.json
+            data/work/action/inventory-run.log
           retention-days: 1
           overwrite: true
   dataportalen:

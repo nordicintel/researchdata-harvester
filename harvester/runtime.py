@@ -12,9 +12,14 @@ import time
 import tomllib
 import zlib
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext
+from contextvars import ContextVar
+from copy import copy
 from datetime import UTC, datetime
+from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -23,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
+dataset_context: ContextVar[str] = ContextVar("dataset_uri", default="-")
 
 
 class RecordError(RuntimeError):
@@ -88,6 +94,10 @@ class Config(BaseModel):
     read_timeout: float = Field(default=30, gt=0)
     attempts: int = Field(default=3, ge=1, le=10)
     operation_deadline: float = Field(default=90, gt=0)
+    retry_initial_delay: float = Field(default=5, ge=0, le=60)
+    retry_max_delay: float = Field(default=60, ge=1, le=600)
+    source_failure_limit: int = Field(default=6, ge=3, le=100)
+    session_reset_delay: float = Field(default=60, ge=0, le=600)
     verification_rows: int = Field(default=100, ge=1, le=100)
     verification_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
     page_size: int = Field(default=100, ge=1, le=100)
@@ -141,23 +151,130 @@ def transient(error: BaseException) -> bool:
     )
 
 
-class Http(httpx.AsyncClient):
+class Http:
     """One client whose normal requests and streamed samples share bounded retries."""
 
     def __init__(self, config: Config, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(
-            timeout=httpx.Timeout(config.read_timeout, connect=config.connect_timeout),
-            follow_redirects=True,
-            headers={"User-Agent": "NordicIntel-Researchdata-Harvester/1.0"},
-        )
         self.config = config
-        self.source = client
+        self._owns_client = client is None
+        self.source = client or self._new_client()
+        self._session_condition = asyncio.Condition()
+        self._active = 0
+        self._resetting = False
+        self._reset_pending = False
         self.limit = asyncio.Semaphore(config.concurrency)
         self.requests = 0
         self.failures = 0
         self.started = time.monotonic()
+        self.source_failures: dict[str, int] = {}
+        self._resume_at: dict[str, float] = {}
+        self._source_gates: dict[str, asyncio.Lock] = {}
 
-    def retry(self) -> AsyncRetrying:
+    def _new_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(self.config.read_timeout, connect=self.config.connect_timeout),
+            follow_redirects=True,
+            headers={"User-Agent": "NordicIntel-Researchdata-Harvester/1.0"},
+        )
+
+    async def __aenter__(self) -> "Http":
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        if self._owns_client:
+            await self.source.aclose()
+
+    def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
+        return self.source.build_request(method, url, **kwargs)
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def _reset_session(self) -> None:
+        async with self._session_condition:
+            await self._session_condition.wait_for(lambda: not self._resetting)
+            if not self._reset_pending:
+                return
+            self._resetting = True
+            try:
+                await self._session_condition.wait_for(lambda: self._active == 0)
+                if self._owns_client:
+                    await self.source.aclose()
+                    self.source = self._new_client()
+                self._reset_pending = False
+                logger.warning("HTTP session restarted after consecutive timeouts; source recovery pause follows")
+            finally:
+                self._resetting = False
+                self._session_condition.notify_all()
+
+    @asynccontextmanager
+    async def attempt(self, url: str, number: int, deadline: float) -> AsyncIterator[None]:
+        """Coordinate recovery per origin while other sources remain available."""
+        origin = urlsplit(url).netloc
+        recovering = bool(self.source_failures.get(origin))
+        gate = self._source_gates.setdefault(origin, asyncio.Lock())
+        async with gate if recovering else nullcontext():
+            if self.source_failures.get(origin, 0) >= self.config.source_failure_limit:
+                raise RecordError("source_unavailable_after_recovery_attempts", url=url, retry=True)
+            delay = max(0, self._resume_at.get(origin, 0) - time.monotonic())
+            if delay:
+                if delay >= deadline - time.monotonic():
+                    raise RecordError("source_backoff_exceeds_operation_deadline", url=url, retry=True)
+                logger.warning(
+                    "source backoff host=%s wait_seconds=%.1f dataset=%s", origin, delay, dataset_context.get()
+                )
+                await asyncio.sleep(delay)
+            async with self.limit:
+                async with self._session_condition:
+                    await self._session_condition.wait_for(lambda: not self._resetting)
+                    self._active += 1
+                self.requests += 1
+                started = time.monotonic()
+                logger.debug("request start dataset=%s url=%s attempt=%s", dataset_context.get(), safe_url(url), number)
+                try:
+                    yield
+                except httpx.HTTPError as error:
+                    self.failures += 1
+                    if transient(error):
+                        self.source_failures[origin] = self.source_failures.get(origin, 0) + 1
+                        if isinstance(error, httpx.TimeoutException) and self.source_failures[origin] == 2:
+                            self._reset_pending = True
+                        if self.source_failures[origin] == self.config.source_failure_limit:
+                            logger.error(
+                                "source unavailable host=%s consecutive_failures=%s; deferring remaining requests for retry",
+                                origin,
+                                self.source_failures[origin],
+                            )
+                    else:
+                        self.source_failures.pop(origin, None)
+                        self._resume_at.pop(origin, None)
+                    logger.warning(
+                        "request failed dataset=%s url=%s attempt=%s exception=%s host_failures=%s seconds=%.3f",
+                        dataset_context.get(),
+                        safe_url(url),
+                        number,
+                        type(error).__name__,
+                        self.source_failures.get(origin, 0),
+                        time.monotonic() - started,
+                    )
+                    raise
+                else:
+                    self.source_failures.pop(origin, None)
+                    self._resume_at.pop(origin, None)
+                finally:
+                    async with self._session_condition:
+                        self._active -= 1
+                        self._session_condition.notify_all()
+                    logger.debug(
+                        "request end dataset=%s url=%s seconds=%.3f",
+                        dataset_context.get(),
+                        safe_url(url),
+                        time.monotonic() - started,
+                    )
+
+    def retry(self, url: str = "", deadline: float | None = None) -> AsyncRetrying:
         def delay(state: Any) -> float:
             error = state.outcome.exception() if state.outcome else None
             if isinstance(error, httpx.HTTPStatusError):
@@ -170,21 +287,58 @@ class Http(httpx.AsyncClient):
                             return max(0, (parsedate_to_datetime(header) - datetime.now(UTC)).total_seconds())
                         except (ValueError, TypeError):
                             pass
-            return float(wait_exponential(multiplier=1, max=10)(state))
+            shared = copy(state)
+            shared.attempt_number = max(state.attempt_number, self.source_failures.get(urlsplit(url).netloc, 0))
+            pause = float(
+                wait_exponential(multiplier=self.config.retry_initial_delay, max=self.config.retry_max_delay)(shared)
+            )
+            return max(pause, self.config.session_reset_delay if self._reset_pending else 0)
+
+        async def before_sleep(state: Any) -> None:
+            pause = float(state.next_action.sleep)
+            await self._reset_session()
+            origin = urlsplit(url).netloc
+            self._resume_at[origin] = max(self._resume_at.get(origin, 0), time.monotonic() + pause)
+            if deadline is not None and pause >= deadline - time.monotonic():
+                logger.warning(
+                    "source retry deferred dataset=%s host=%s wait_seconds=%.1f exceeds remaining deadline",
+                    dataset_context.get(),
+                    origin,
+                    pause,
+                )
+                raise RecordError("source_backoff_exceeds_operation_deadline", url=url, retry=True)
+            error = state.outcome.exception()
+            logger.warning(
+                "retry dataset=%s url=%s attempt=%s/%s exception=%s wait_seconds=%.1f",
+                dataset_context.get(),
+                safe_url(url),
+                state.attempt_number,
+                self.config.attempts,
+                type(error).__name__,
+                pause,
+            )
 
         return AsyncRetrying(
-            stop=stop_after_attempt(self.config.attempts), wait=delay, retry=retry_if_exception(transient), reraise=True
+            stop=stop_after_attempt(self.config.attempts),
+            wait=delay,
+            retry=retry_if_exception(
+                lambda error: (
+                    transient(error)
+                    and self.source_failures.get(urlsplit(url).netloc, 0) < self.config.source_failure_limit
+                )
+            ),
+            before_sleep=before_sleep,
+            reraise=True,
         )
 
     async def request(self, method: str, url: httpx.URL | str, **kwargs: Any) -> httpx.Response:
+        deadline = time.monotonic() + self.config.operation_deadline
         try:
-            async with asyncio.timeout(self.config.operation_deadline), self.limit:
-                async for attempt in self.retry():
+            async with asyncio.timeout(self.config.operation_deadline):
+                async for attempt in self.retry(str(url), deadline):
                     with attempt:
-                        self.requests += 1
-                        started = time.monotonic()
-                        try:
-                            source = self.source or self
+                        async with self.attempt(str(url), attempt.retry_state.attempt_number, deadline):
+                            source = self.source
                             async with source.stream(method, url, **kwargs) as incoming:
                                 incoming.raise_for_status() if incoming.status_code in {
                                     429,
@@ -210,77 +364,95 @@ class Http(httpx.AsyncClient):
                                     request=incoming.request,
                                 )
                             logger.debug(
-                                "request url=%s attempt=%s status=%s seconds=%.3f",
+                                "request url=%s attempt=%s status=%s requests=%s",
                                 safe_url(str(url)),
                                 attempt.retry_state.attempt_number,
                                 response.status_code,
-                                time.monotonic() - started,
+                                self.requests,
                             )
                             if response.status_code in {429, 500, 502, 503, 504}:
                                 response.raise_for_status()
                             return response
-                        except httpx.HTTPError as error:
-                            self.failures += 1
-                            logger.debug("request failed url=%s exception=%s", safe_url(str(url)), type(error).__name__)
-                            raise
+
         except TimeoutError as error:
+            logger.warning(
+                "operation deadline exhausted dataset=%s url=%s seconds=%s",
+                dataset_context.get(),
+                safe_url(str(url)),
+                self.config.operation_deadline,
+            )
             raise httpx.ReadTimeout("HTTP operation deadline exhausted", request=httpx.Request(method, url)) from error
         raise RuntimeError("Retry loop produced no response")
 
-    async def sample(self, url: str) -> tuple[bytes, str, str, int]:
+    async def sample(self, url: str) -> tuple[bytes, str, str, int, str | None]:
         """Read bounded content, stopping text resources after enough complete lines."""
+        deadline = time.monotonic() + self.config.operation_deadline
         try:
-            async with asyncio.timeout(self.config.operation_deadline), self.limit:
-                async for attempt in self.retry():
+            async with asyncio.timeout(self.config.operation_deadline):
+                async for attempt in self.retry(str(url), deadline):
                     with attempt:
-                        self.requests += 1
-                        source = self.source or self
-                        # stream() uses send(), so it does not reenter request()'s semaphore.
-                        async with source.stream(
-                            "GET", url, follow_redirects=True, headers={"Accept-Encoding": "identity"}
-                        ) as response:
-                            response.raise_for_status()
-                            content_type = response.headers.get("content-type", "").split(";")[0]
-                            is_text = (
-                                any(
-                                    ext in response.headers.get("content-disposition", "").lower()
-                                    for ext in (".csv", ".tsv")
+                        async with self.attempt(url, attempt.retry_state.attempt_number, deadline):
+                            source = self.source
+                            # stream() uses send(), so it does not reenter request()'s semaphore.
+                            async with source.stream(
+                                "GET", url, follow_redirects=True, headers={"Accept-Encoding": "identity"}
+                            ) as response:
+                                response.raise_for_status()
+                                content_type = response.headers.get("content-type", "").split(";")[0]
+                                disposition = Message()
+                                disposition["Content-Disposition"] = response.headers.get("content-disposition", "")
+                                filename = disposition.get_filename()
+                                is_text = (
+                                    any(
+                                        ext in response.headers.get("content-disposition", "").lower()
+                                        for ext in (".csv", ".tsv")
+                                    )
+                                    or content_type in {"text/csv", "text/tab-separated-values"}
+                                    or urlsplit(url).path.lower().endswith((".csv", ".tsv"))
                                 )
-                                or content_type in {"text/csv", "text/tab-separated-values"}
-                                or urlsplit(url).path.lower().endswith((".csv", ".tsv"))
-                            )
-                            decoder = (
-                                zlib.decompressobj(16 + zlib.MAX_WBITS)
-                                if response.headers.get("content-encoding") == "gzip"
-                                else None
-                            )
-                            data = bytearray()
-                            transferred = 0
+                                decoder = (
+                                    zlib.decompressobj(16 + zlib.MAX_WBITS)
+                                    if response.headers.get("content-encoding") == "gzip"
+                                    else None
+                                )
+                                data = bytearray()
+                                transferred = 0
 
-                            async def chunks() -> AsyncIterator[bytes]:
-                                if response.is_stream_consumed:
-                                    yield response.content
-                                else:
-                                    async for block in response.aiter_raw():
-                                        yield block
+                                async def chunks() -> AsyncIterator[bytes]:
+                                    if response.is_stream_consumed:
+                                        yield response.content
+                                    else:
+                                        async for block in response.aiter_raw():
+                                            yield block
 
-                            async for chunk in chunks():
-                                transferred += len(chunk)
-                                if transferred > self.config.verification_bytes:
-                                    raise ValueError("transferred_byte_limit")
-                                if decoder:
-                                    chunk = decoder.decompress(chunk, self.config.verification_bytes - len(data) + 1)
-                                data.extend(chunk)
-                                if len(data) > self.config.verification_bytes:
-                                    raise ValueError("decompressed_byte_limit")
-                                if is_text and data.count(b"\n") > self.config.verification_rows + 1:
-                                    break
-                            if urlsplit(url).path.lower().endswith(".gz") and data[:2] == b"\x1f\x8b":
-                                unzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                                data = bytearray(unzip.decompress(bytes(data), self.config.verification_bytes + 1))
-                                if len(data) > self.config.verification_bytes or not unzip.eof:
-                                    raise ValueError("decompressed_byte_limit")
-                            return bytes(data), str(response.url), content_type, transferred
+                                async for chunk in chunks():
+                                    transferred += len(chunk)
+                                    if transferred > self.config.verification_bytes:
+                                        raise ValueError("transferred_byte_limit")
+                                    if decoder:
+                                        chunk = decoder.decompress(
+                                            chunk, self.config.verification_bytes - len(data) + 1
+                                        )
+                                    data.extend(chunk)
+                                    if len(data) > self.config.verification_bytes:
+                                        raise ValueError("decompressed_byte_limit")
+                                    if is_text and data.count(b"\n") > self.config.verification_rows + 1:
+                                        break
+                                if urlsplit(url).path.lower().endswith(".gz") and data[:2] == b"\x1f\x8b":
+                                    unzip = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                                    data = bytearray(unzip.decompress(bytes(data), self.config.verification_bytes + 1))
+                                    if len(data) > self.config.verification_bytes or not unzip.eof:
+                                        raise ValueError("decompressed_byte_limit")
+                                return bytes(data), str(response.url), content_type, transferred, filename
+        except zlib.error as error:
+            raise ValueError("Malformed gzip resource") from error
+
         except TimeoutError as error:
+            logger.warning(
+                "operation deadline exhausted dataset=%s url=%s seconds=%s",
+                dataset_context.get(),
+                safe_url(str(url)),
+                self.config.operation_deadline,
+            )
             raise httpx.ReadTimeout("HTTP sample deadline exhausted", request=httpx.Request("GET", url)) from error
         raise RuntimeError("Retry loop produced no sample")
