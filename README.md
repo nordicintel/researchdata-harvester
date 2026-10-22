@@ -1,14 +1,162 @@
 # Researchdata harvester
 
-Harvest the current [Researchdata catalog](https://researchdata.se/), its corresponding [Dataportalen](https://www.dataportal.se/) records, and accessible metadata from linked repositories.
+Harvest current entries from Dataportalen's Researchdata catalog, retrieve their metadata and publish datasets with verified tabular observations. Output is two typed Parquet tables, a current inventory, a semantic cache and a checksummed manifest. Research observations are inspected temporarily, never published.
 
-## Development
+## Setup
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run
-`uv sync --locked`. The checked-in `.python-version` selects Python 3.12; uv
-installs it if necessary. Development dependencies are included by default.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
 
-Run these checks before committing:
+```sh
+git clone https://github.com/nordicintel/researchdata-harvester.git
+cd researchdata-harvester
+uv sync --locked
+uv run python -m scripts.split_data_files --install
+```
+
+Python 3.12 is selected by `.python-version`. There is no package installation, server or installed CLI. VS Code defaults to `.venv`; use **Python: Select Interpreter** if another environment was previously selected.
+
+| Directory | Role |
+|---|---|
+| `harvester/` | Retrieval, semantic resolution, verification and output construction. |
+| `scripts/` | Sync, publication and oversized-file hook commands. |
+| `tests/` | Essential offline behavior tests. |
+| `.github/workflows/` | Coordinated harvesting and validation. |
+| `data/current/` | Published data and next-run state. |
+| `data/work/` | Ignored temporary artifacts and reports. |
+| `data/downloads/` | Preserved local downloads, ignored by Git. |
+
+## Harvest and eligibility
+
+```sh
+uv run python -m scripts.sync
+uv run python -m scripts.sync --full
+```
+
+The default is incremental. Existing current files supply state. An empty destination starts fresh and does not borrow another directory's state. Local sync replaces its destination after validation but does not commit or push.
+
+Inventory uses Dataportalen context `818`, excludes `NON_PUBLIC` and confirms membership against the catalog document. Registry modification values are separate from descriptive dataset dates. New entries, changed registry values or identity evidence, and transient failures select work. `--full` refreshes all candidates. Exact revision suffixes are retained, without historical-version retrieval, snapshots, full OAI enumeration or sitemap scans.
+
+Selected records independently revalidate linked mutable metadata. Unchanged datasets do not trigger external crawling. Changes that never reach Dataportalen are discovered on another selection trigger or an explicit full run.
+
+A new dataset must yield columns and an observation row. Public metadata, HTTP 200 and file extensions are insufficient. Missing distributions are allowed when explicitly linked repositories provide data. Unspecified rights and anonymous licence acknowledgements are allowed. Accounts, API keys, payment and individual approval are excluded. Licence terms are retained without a commercial-use filter.
+
+Verification supports CSV/TSV, flat JSON observations, XLSX, XLS, supported statistical files and Parquet, including gzip wrappers. Generic archives, documents, imagery, map layers and APIs with unknown selectors remain unresolved. At most 100 rows and 32 MiB of transferred/decompressed content are inspected per resource.
+
+Required-source failures prevent publication. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Verification does not establish redistribution rights.
+
+## Scoped execution and recovery
+
+```sh
+uv run python -m scripts.sync --limit 10 --destination data/work/sample-current --work-directory data/work/sample
+uv run python -m scripts.sync --dataset-uri "https://doi.org/10.5878/d4bn-b702" --destination data/work/selected-current --work-directory data/work/selected --log-level DEBUG
+```
+
+`--dataset-uri` is repeatable and cannot combine with `--limit`. Scoped runs require an ignored destination, cannot infer catalog-wide removals and cannot publish. Limited runs stop at their sample.
+
+Use `--config config.local.toml` for an ignored complete alternative configuration. Configured paths resolve relative to the TOML file; CLI paths resolve relative to the working directory. `--report data/work/report.json` selects the report path.
+
+Reuse a work directory after interruption. Completed record artifacts are reusable only when inputs, configuration and implementation fingerprints agree. Pagination restarts. Use another work directory after a completed candidate build.
+
+```sh
+uv run python -m scripts.sync --stage inventory --work-directory data/work/run
+uv run python -m scripts.sync --stage dataportalen --work-directory data/work/run
+uv run python -m scripts.sync --stage researchdata --work-directory data/work/run
+uv run python -m scripts.sync --stage build --work-directory data/work/run
+```
+
+Fetch stages write artifacts; build writes a candidate without replacing production. Interrupted directory replacement recovers automatically. A lock filename alone does not establish a running process. Do not delete lock/replacement directories as routine recovery.
+
+INFO logs show progress. DEBUG adds redacted requests, attempts, cache decisions and parser outcomes. Reports contain counts, reasons, requests, timing and output sizes. Credentials, raw response bodies and observation values are not logged.
+
+## Output and semantic definitions
+
+Consumers discover filenames through `manifest.json`. The default is exactly two Zstandard Parquet files. A table splits only when its compressed size reaches 100,000,000 bytes. Parts use consecutive identity ranges and `_part_1` suffixes; the builder uses the fewest successful equal-row parts.
+
+| File | Content |
+|---|---|
+| `datasets.parquet` | Enriched metadata, associations, resources and verification evidence. |
+| `dataportalen.parquet` | Registry identity and complete Dataportalen metadata and related entities. |
+| `inventory.json` | Membership, modification signals, outcomes, retry decisions and associations. |
+| `rdf-cache.json.gz` | Vocabulary/schema definitions and mutable metadata with validators/stale outcomes. |
+| `manifest.json` | Schema version, coverage, filenames, counts, sizes and SHA-256 checksums. |
+
+Join tables on `dataset_uri`; identities are identical and unique. Multilingual values and repeated agents, distributions and services use nested structures. `properties` preserves assertions with value type, language, datatype, source URL, entity, graph, predicate and path. Conflicting assertions stay separate. JSON paths preserve array positions and empty containers.
+
+```python
+import json
+from pathlib import Path
+import duckdb
+
+root = Path("data/current")
+manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+files = [str(root / name) for name, info in manifest["files"].items() if info.get("table") == "datasets"]
+with duckdb.connect() as connection:
+    print(
+        connection.execute(
+            "SELECT dataset_uri, titles[1].value AS title, availability FROM read_parquet(?) LIMIT 10",
+            [files],
+        ).fetchall()
+    )
+```
+
+Keep tables, inventory, cache and manifest together. Independent edits break consistency.
+
+`harvester/vocabulary.py` resolves RDF/JSON, JSON-LD, JSON Schema and schemas in OpenAPI 3.x JSON. It preserves unknown attributes and deterministic anonymous identities. Static schema references support pointers, anchors, relative identifiers and cycles. Dynamic/recursive evaluation is explicitly unsupported. It does not validate observations or execute API operations.
+
+```python
+from pathlib import Path
+from harvester.runtime import Config, Http
+from harvester.vocabulary import SemanticResolver
+
+
+async def resolve(document, source_url):
+    async with Http(Config()) as client:
+        async with SemanticResolver(
+            Path("data/current/rdf-cache.json.gz"),
+            client,
+            Path("data/work/semantic-updates.json.gz"),
+        ) as resolver:
+            return await resolver.resolve(document, source_url=source_url)
+```
+
+Use `format="json-schema"` for schemas without `$schema`, including boolean schemas. Missing caches start empty. Vocabulary definitions are reused; requested mutable entities are revalidated. Workers leave published cache files untouched. Build merges updates, rejects conflicts and prunes unreferenced mutable entries. The existing RDF filename also covers non-RDF definitions.
+
+## Configuration
+
+| Setting | Default | Allowed values and purpose |
+|---|---|---|
+| `current_directory` | `data/current` | Filesystem path for independent output/state. |
+| `search_url` | `https://admin.dataportal.se/store/search` | Registry endpoint URL. |
+| `context_url` | `https://admin.dataportal.se/store/818` | Exact catalog context URL. |
+| `catalog_metadata_url` | `https://admin.dataportal.se/store/818/metadata/9198` | Catalog membership metadata URL. |
+| `catalog_uri` | `https://researchdata.se/catalogue/` | Exact RDF catalog identity. |
+| `oai_url` | `https://api.researchdata.se/oai-pmh` | Targeted current-record metadata endpoint. |
+| `concurrency` | `4` | Integer 1-32, simultaneous requests per process. |
+| `connect_timeout` | `10` | Positive seconds for connection establishment. |
+| `read_timeout` | `30` | Positive seconds of response inactivity. |
+| `attempts` | `3` | Integer 1-10 including the first attempt. |
+| `operation_deadline` | `90` | Positive seconds including retries/backoff. |
+| `verification_rows` | `100` | Integer 1-100, maximum inspected observations. |
+| `verification_bytes` | `33554432` | Positive bytes, default 32 MiB. |
+| `page_size` | `100` | Integer 1-100, registry page size. |
+
+Change endpoints only for an intentional source migration or test. Lower concurrency for constrained sources. Adjust limits when diagnosing explicit outcomes. There is no implicit configuration overlay.
+
+## GitHub operation
+
+Harvest runs daily at **03:17 UTC**. Use **Actions > Harvest > Run workflow** for a manual run and its full-refresh option.
+
+Inventory feeds two reusable fetch workflows in parallel. Publication waits for both, validates the candidate and publishes only generated current data directly to `main`. Artifacts expire after one day. Runs are serialized without cancelling active work. Fetch jobs are read-only; only publication receives write permission.
+
+```sh
+uv run python -m scripts.publish --candidate data/work/run/candidate --expected-head "<base-main-commit>"
+```
+
+Publication requires a complete candidate, `main` at the expected base commit, a clean index and an unchanged remote head. If `main` advances, update and rerun. Never force-push or publish an old candidate over newer data.
+
+## Validation and maintenance
+
+These commands are offline:
 
 ```sh
 uv run ruff check .
@@ -16,115 +164,39 @@ uv run ruff format --check .
 uv run mypy
 uv run pyright
 uv run python -m pytest
+uv run python -m scripts.sync --stage validate --destination data/current
 ```
 
-Use `uv run ruff check --fix .` and `uv run ruff format .` to apply lint fixes
-and formatting. Ruff uses 120-character lines, double quotes and space
-indentation. Write English identifiers, type annotations and Google-style
-docstrings; use absolute imports. Strict mypy checks `harvester/` and `scripts/`.
-Pyright also checks these modules using the same analysis engine as Pylance.
-VS Code defaults to `.venv`; if it already saved another interpreter, run
-**Python: Select Interpreter** and select this repository’s `.venv`. PyLD lacks
-a `py.typed` marker, so mypy exempts its imports; Pyright still examines its
-inline annotations.
-
-The Validate workflow runs these offline checks on pushes and pull requests.
-It does not run a network harvest. Splitter tests stay outside the default
-suite; after changing the commit-hook script, also run:
+Catalog validation requires a published generation. Default pytest excludes splitter tests. After changing the splitter, also run:
 
 ```sh
 uv run python -m pytest tests/test_split_data_files.py
 ```
 
-Manage dependencies with `uv add` or `uv add --dev`. To upgrade locked versions,
-run `uv lock --upgrade`, then `uv sync --locked` and the checks above. Commit
-`pyproject.toml` and `uv.lock` together. Source-facing changes also need a scoped
-live check of the affected source.
+Manage dependencies with uv. Use `uv lock --upgrade`, then `uv sync --locked`, offline checks and scoped live checks for source-facing changes. Commit the dependency manifest and lockfile together.
 
-## Dataportalen API "guide"
+Use English names, annotations and useful Google-style docstrings. Ruff uses 120-character lines, double quotes and spaces. Mypy is strict and Pyright also checks active code. PyLD's missing `py.typed` marker is narrowly exempted for mypy.
 
-[Dataportalen API Guide](https://docs.dataportal.se/registry/api/)
+| Problem | Action |
+|---|---|
+| Required source failure or inventory disagreement | Inspect the report/log, correct the issue and rerun. Published state remains unchanged. |
+| External source failure | Inspect its outcome; prior metadata may remain stale and transient failures retry. |
+| Invalid configuration | Correct the named setting before network work. |
+| Checksum failure | Restore a consistent generation; do not rewrite checksums to conceal corruption. |
+| Concurrent local run | Let the lock holder finish or deliberately stop that process. |
+| Publication race | Update from `main` and rerun. |
+| Existing completed candidate | Inspect it, then use another work directory for a new build. |
 
-TO BE FILLED OUT ONCE THE IMPLEMENTATION THE NEW VERSION IS COMPLETED.
+## Oversized-file hook
 
-## Automatic Parquet and JSONL splitting before commits
+The hook supports `.parquet`, `.jsonl`, `.parquet.gz` and `.jsonl.gz`. Files of 100 MB or larger split into `_part_1` filenames. Its 50 MB target estimates initial part count; the final check only requires each part below 100 MB. Configure `[tool.split-data-files]` in `pyproject.toml`; MB is decimal.
 
-Install the locked dependencies and enable the hook once per checkout:
+JSONL line bytes remain intact. DuckDB writes Parquet and gzip headers are deterministic. The hook rejects conflicting filenames and differences between staged and working copies. It stages only selected replacements and does not update manifests. The catalog builder therefore completes partitioning/checksums before staging, so publication triggers no further splitting.
 
-```sh
-uv sync --locked
-uv run python -m scripts.split_data_files --install
-```
+## External documentation
 
-Commit normally. The hook replaces staged `.parquet`, `.jsonl`, `.parquet.gz`
-and `.jsonl.gz` files of 100 MB or larger, then stages the replacements
-automatically. Smaller files stay unchanged. Part numbers precede the complete
-suffix, for example `name_part_1.parquet.gz` or `name_part_2.jsonl`.
-
-Configure `[tool.split-data-files]` in `pyproject.toml`. `max_mb = 100` is the
-threshold and final maximum; `target_mb = 50` is only an initial size estimate.
-MB means 1,000,000 bytes. The initial part count is the original byte size
-divided by the target, rounded up, and rows are divided as evenly as possible.
-DuckDB writes internally Zstandard-compressed Parquet parts. JSONL splits at
-complete lines and preserves their bytes, order and line endings without
-reserializing or validating individual JSON records. Gzip inputs produce
-independently readable gzip parts, with deterministic gzip headers. For gzip
-files, both the initial estimate and final size checks use compressed bytes;
-temporary decompression requires disk space for the uncompressed contents.
-Parts may exceed the target but must
-remain below the maximum; more parts are attempted only if that maximum is hit.
-
-The hook refuses to overwrite existing part files or split a file whose staged
-and working copies differ. Resolve that conflict and commit again. Only the
-selected data-file replacements are staged; unrelated edits remain untouched.
-All splits are prepared before replacement, and an ordinary preparation or
-staging failure leaves the original files and index intact. Other metadata
-files that reference filenames, such as manifests, are not rewritten by this hook.
-
-For a manual run or smaller development thresholds:
-
-```sh
-uv run python -m scripts.split_data_files --max-mb 1 --target-mb 0.5
-```
-
-Git does not enable repository hooks automatically after cloning. Run the
-installation command in each checkout, including CI checkouts that should use
-the hook. The existing published-data builder remains responsible for producing
-consistent filenames and manifests.
-
-
-## Semantic definitions
-
-`harvester/vocabulary.py` exposes one resolver for RDF/JSON, JSON-LD, JSON
-Schema and schemas embedded in OpenAPI 3.x JSON documents:
-
-```python
-from pathlib import Path
-import httpx
-from harvester.vocabulary import SemanticResolver
-
-async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-    async with SemanticResolver(
-        Path("data/rdf-cache.json.gz"),
-        client,
-        Path("data/work/semantic-updates.json.gz"),
-    ) as resolver:
-        result = await resolver.resolve(document, source_url=document_url)
-```
-
-Run this within an async function. Pass `format="json-schema"` for schemas
-without `$schema`, including boolean schemas. RDF results contain normalized
-properties and semantic definitions; schema results contain complete `schemas`
-and `schema_references` with resolution outcomes. Original input is preserved.
-Static references support JSON Pointers, anchors, relative identifiers and cycles.
-Dynamic/recursive references are retained with an explicit unsupported outcome;
-this module does not validate data instances. OpenAPI support collects component
-and inline schemas, not API operations or referenced response/request documents.
-Examples, citations and arbitrary URLs do not trigger retrieval.
-
-The gzip JSON cache also stores non-RDF definitions; its existing filename can
-stay unchanged. Successful context exit saves only worker updates, leaving the
-published cache untouched. The build stage merges those updates using `RdfCache`
-as documented at the top of the module. Failed resolution does not publish an
-update artifact. These are internal building blocks; the redesigned workflows
-have not yet been wired to them.
+- [Dataportalen registry API](https://docs.dataportal.se/registry/api/)
+- [EntryStore search](https://entrystore.org/kb/search/)
+- [Researchdata API](https://docs.researchdata.se/api/)
+- [Researchdata JSON-LD](https://docs.researchdata.se/metadata/schema-org-json-ld/)
+- [DuckDB Parquet](https://duckdb.org/docs/stable/data/parquet/overview)

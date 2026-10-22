@@ -25,3 +25,8 @@ jobs:
       - run: uv run mypy
       - run: uv run pyright
       - run: uv run python -m pytest
+      - name: Validate published catalog
+        run: |
+          if [ -f data/current/manifest.json ]; then
+            uv run python -m scripts.sync --stage validate --destination data/current
+          fi

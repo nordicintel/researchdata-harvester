@@ -18,3 +18,5 @@ config.local.toml
 /legacy/
 
 .mypy_cache/
+
+!data/current/*.json.gz

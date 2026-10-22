@@ -473,3 +473,13 @@ async def test_schema_references_and_openapi(tmp_path: Path) -> None:
             boolean = await resolver.resolve(False, source_url=source_url, format="json-schema")
             assert boolean.schemas[source_url] is False
         assert (tmp_path / "updates.gz").exists()
+
+
+def test_rdf_unicode_line_separators_preserve_literal_values() -> None:
+    from harvester.vocabulary import normalize_rdf
+
+    text = "First\u2028second\u2029third\x85fourth"
+    document = {
+        "https://example.org/dataset": {"http://purl.org/dc/terms/description": [{"type": "literal", "value": text}]}
+    }
+    assert normalize_rdf(document, "https://example.org/metadata")[0]["value"] == text

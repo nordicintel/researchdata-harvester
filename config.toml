@@ -1,11 +1,15 @@
-# Paths resolve relative to this configuration file, independently of cwd.
+# Configured paths resolve relative to this file. Durations are seconds.
 current_directory = "data/current"
-oai_url = "https://api.researchdata.se/oai-pmh"
-sitemap_url = "https://researchdata.se/catalogue/sitemap.xml"
-sparql_url = "https://admin.dataportal.se/sparql"
+search_url = "https://admin.dataportal.se/store/search"
+context_url = "https://admin.dataportal.se/store/818"
 catalog_metadata_url = "https://admin.dataportal.se/store/818/metadata/9198"
 catalog_uri = "https://researchdata.se/catalogue/"
-timeout = 90
+oai_url = "https://api.researchdata.se/oai-pmh"
 concurrency = 4
-retries = 5
-identity_batch_size = 100
+connect_timeout = 10
+read_timeout = 30
+attempts = 3
+operation_deadline = 90
+verification_rows = 100
+verification_bytes = 33554432
+page_size = 100

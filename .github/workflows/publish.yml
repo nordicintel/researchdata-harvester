@@ -1,0 +1,53 @@
+name: Publish
+on:
+  workflow_call:
+    inputs:
+      base_commit:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify base checkout
+        env:
+          EXPECTED_HEAD: ${{ inputs.base_commit }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+      - uses: astral-sh/setup-uv@v10.3.1
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - uses: actions/download-artifact@v8
+        with:
+          name: inventory
+          path: data/work/action
+      - uses: actions/download-artifact@v8
+        with:
+          name: dataportalen
+          path: data/work/action
+      - uses: actions/download-artifact@v8
+        with:
+          name: researchdata
+          path: data/work/action
+      - run: uv run python -m scripts.sync --stage build --work-directory data/work/action
+      - name: Publish validated current data
+        env:
+          EXPECTED_HEAD: ${{ inputs.base_commit }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          uv run python -m scripts.publish --candidate data/work/action/candidate --expected-head "$EXPECTED_HEAD"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: harvest-report
+          path: data/work/action/report.json
+          retention-days: 1
+          if-no-files-found: warn

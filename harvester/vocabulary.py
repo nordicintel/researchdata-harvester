@@ -37,7 +37,8 @@ missing or invalid contexts fail resolution rather than guessing their meaning.
 Importing does no I/O. Context entry loads rdf-cache.json.gz or starts empty if
 it is absent. Successful context exit atomically writes a deterministic gzip
 JSON update artifact, creating its directory/file if necessary. No updates are
-saved after an exception, cancellation or failed resolve call. The published
+saved after an uncaught exception, cancellation or failed required resolve call.
+Caught failures of resolve(required=False) preserve other completed work. The published
 cache remains read-only; use a different, run-specific updates_path for each job.
 Await all resolve calls before leaving the context. The caller owns client
 lifetime, transport timeouts and retries; the resolver limits concurrent lookups.
@@ -629,17 +630,15 @@ def _normalize(
                             "object": obj,
                         }
                     )
-        normalized = jsonld.normalize(
-            jsonld.JsonLdProcessor.to_nquads({"@default": triples}),
-            cast(jsonld.NormalizeOptions, {**options, "inputFormat": "application/n-quads"}),
-        )
+        normalized = _canonical_dataset({"@default": triples})
     else:
         expanded = jsonld.expand(
             document,
             options=cast(jsonld.ExpandOptions, options),
             on_property_dropped=lambda name: dropped.add(name or "<unmapped>"),
         )
-        normalized = jsonld.normalize(expanded, cast(jsonld.NormalizeOptions, options))
+        dataset = jsonld.JsonLdProcessor().to_rdf(expanded, options)
+        normalized = _canonical_dataset(cast(dict[str, Any], dataset))
     if not isinstance(normalized, dict):
         raise ValueError("Expected a normalized RDF dataset; N-Quads string output is not enabled")
     scope = hashlib.sha256(source_url.encode()).hexdigest()[:16]
@@ -697,6 +696,7 @@ class SemanticResolver:
         full: bool = False,
         concurrency: int = 4,
         documents: Mapping[str, str] | None = None,
+        cache: RdfCache | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be positive")
@@ -711,6 +711,7 @@ class SemanticResolver:
         self._documents[NAMESPACES["schema"]] = "https://schema.org/version/latest/schemaorg-current-https.jsonld"
         self._documents.update(documents or {})
         self._definitions: dict[str, asyncio.Task[tuple[CacheEntry, list[dict[str, Any]]]]] = {}
+        self._shared_cache = cache
         self._active = False
         self._failed = False
         self._pending = 0
@@ -718,7 +719,7 @@ class SemanticResolver:
     async def __aenter__(self) -> "SemanticResolver":
         if self._active or hasattr(self, "_cache"):
             raise RuntimeError("Use a new SemanticResolver for each run")
-        self._cache = RdfCache.load(self._path)
+        self._cache = self._shared_cache or RdfCache.load(self._path)
         self._active = True
         return self
 
@@ -919,6 +920,7 @@ class SemanticResolver:
         *,
         source_url: str,
         format: Literal["auto", "rdf", "json-schema", "openapi"] = "auto",
+        required: bool = True,
     ) -> ResolvedMetadata:
         """Expand/canonicalize metadata and annotate only its semantic resources.
 
@@ -977,8 +979,41 @@ class SemanticResolver:
                 semantics=semantics,
                 unmapped_properties=dropped,
             )
-        except BaseException:
-            self._failed = True
+        except BaseException as error:
+            if required or not isinstance(error, (ValueError, CacheFetchError)):
+                self._failed = True
             raise
         finally:
             self._pending -= 1
+
+
+def normalize_rdf(document: dict[str, Any], source_url: str) -> list[dict[str, Any]]:
+    """Canonicalize registry RDF/JSON without fetching semantic definitions."""
+
+    def no_context(url: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        raise ValueError(f"Registry RDF/JSON must not require a remote context: {url}")
+
+    return _normalize(document, source_url, no_context)[0]
+
+
+def _canonical_dataset(dataset: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize RDF without PyLD splitting Unicode separators inside literals."""
+    nquads = cast(str, jsonld.URDNA2015().main(dataset, {"format": "application/n-quads"}))
+    marker = "NORDICINTEL_LINE_SEPARATOR_"
+    while marker in nquads:
+        marker += "_"
+    escapes = {f"{marker}{ord(char):04x}_": char for char in "\v\f\x1c\x1d\x1e\x85\u2028\u2029"}
+    for token, char in escapes.items():
+        nquads = nquads.replace(char, token)
+    normalized: dict[str, Any] = {}
+    # Canonical output is already deduplicated; parsing each quad avoids PyLD's
+    # quadratic duplicate scan on large coordinate/property graphs.
+    for line in nquads.splitlines():
+        for graph, triples in jsonld.JsonLdProcessor.parse_nquads(line + "\n").items():
+            normalized.setdefault(graph, []).extend(triples)
+    for triples in normalized.values():
+        for triple in triples:
+            for component in triple.values():
+                for token, char in escapes.items():
+                    component["value"] = component["value"].replace(token, char)
+    return normalized

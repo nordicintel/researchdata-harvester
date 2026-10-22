@@ -1,0 +1,36 @@
+name: Fetch dataportalen
+on:
+  workflow_call:
+    inputs:
+      base_commit:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.base_commit }}
+      - uses: astral-sh/setup-uv@v10.3.1
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - uses: actions/download-artifact@v8
+        with:
+          name: inventory
+          path: data/work/action
+      - run: uv run python -m scripts.sync --stage dataportalen --work-directory data/work/action
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dataportalen
+          path: |
+            data/work/action/dataportalen.json
+            data/work/action/dataportalen-cache.json.gz
+            data/work/action/dataportalen/
+          retention-days: 1
+          if-no-files-found: warn
