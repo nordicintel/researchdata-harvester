@@ -126,7 +126,9 @@ async def fetch(
                     logger.exception("%s failed dataset=%s", stage, uri)
                     raise
 
-        await asyncio.gather(*(record(uri) for uri in plan["selected"]))
+        async with asyncio.TaskGroup() as tasks:
+            for uri in plan["selected"]:
+                tasks.create_task(record(uri))
         baseline_cache = read_cache(current / "rdf-cache.json.gz") if (current / "rdf-cache.json.gz").exists() else {}
         payload = {
             "implementation": plan["implementation"],
@@ -218,10 +220,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         if args.stage == "all":
             async with Http(config) as shared_http:
-                dp, rd = await asyncio.gather(
-                    fetch("dataportalen", plan, config, work, current, shared_http),
-                    fetch("researchdata", plan, config, work, current, shared_http),
-                )
+                async with asyncio.TaskGroup() as tasks:
+                    dp_task = tasks.create_task(fetch("dataportalen", plan, config, work, current, shared_http))
+                    rd_task = tasks.create_task(fetch("researchdata", plan, config, work, current, shared_http))
+                dp, rd = dp_task.result(), rd_task.result()
                 fetch_requests = shared_http.requests
         else:
             dp, rd = (read_json(work / (stage + ".json")) for stage in ("dataportalen", "researchdata"))

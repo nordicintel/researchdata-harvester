@@ -21,6 +21,7 @@ import duckdb
 import httpx
 from defusedxml.ElementTree import fromstring
 from openpyxl.utils.exceptions import InvalidFileException
+from pyld.jsonld import JsonLdError
 from pyreadstat import ReadstatError
 from xlrd.biffh import XLRDError
 
@@ -555,11 +556,22 @@ async def harvest(
                         }
                     )
                 documents.append({"url": source_url, "metadata": item, "properties": resolved.properties, "json": True})
-            except (ValueError, CacheFetchError) as error:
+            except (ValueError, CacheFetchError, JsonLdError) as error:
                 sources.append(
                     {"url": source_url, "outcome": "unavailable", "stale": False, "reason": type(error).__name__}
                 )
-                retry = True
+                retry = retry or any(
+                    marker in str(error)
+                    for marker in (
+                        "Timeout",
+                        "ConnectError",
+                        "HTTP 429",
+                        "HTTP 500",
+                        "HTTP 502",
+                        "HTTP 503",
+                        "HTTP 504",
+                    )
+                )
     names: dict[str, str] = {}
     for document in documents:
         for node in objects(document["metadata"]):

@@ -980,7 +980,7 @@ class SemanticResolver:
                 unmapped_properties=dropped,
             )
         except BaseException as error:
-            if required or not isinstance(error, (ValueError, CacheFetchError)):
+            if required or not isinstance(error, (ValueError, CacheFetchError, jsonld.JsonLdError)):
                 self._failed = True
             raise
         finally:
