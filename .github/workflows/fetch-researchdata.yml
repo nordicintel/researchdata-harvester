@@ -23,6 +23,13 @@ jobs:
         with:
           name: inventory
           path: data/work/action
+      - name: Restore completed records on a rerun
+        if: github.run_attempt > 1
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: researchdata
+          path: data/work/action
       - run: uv run python -m scripts.sync --stage researchdata --work-directory data/work/action
       - uses: actions/upload-artifact@v7
         if: always()
@@ -33,4 +40,5 @@ jobs:
             data/work/action/researchdata-cache.json.gz
             data/work/action/researchdata/
           retention-days: 1
+          overwrite: true
           if-no-files-found: warn

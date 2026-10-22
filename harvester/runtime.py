@@ -25,6 +25,54 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 logger = logging.getLogger(__name__)
 
 
+class RecordError(RuntimeError):
+    """Expected source failure confined to one record or document."""
+
+    def __init__(self, reason: str, *, url: str = "", retry: bool = False) -> None:
+        super().__init__(reason)
+        self.url = safe_url(url) if url else ""
+        self.retry = retry
+
+
+def record_key(plan: dict[str, Any], entry: dict[str, Any]) -> str:
+    """Identify source inputs independently of previous processing outcomes."""
+    return fingerprint(
+        [
+            plan["implementation"],
+            plan["configuration"],
+            {
+                key: entry.get(key)
+                for key in (
+                    "dataset_uri",
+                    "registry_entry_uri",
+                    "metadata_url",
+                    "registry_modified_value",
+                    "fingerprint",
+                )
+            },
+        ]
+    )
+
+
+def validate_result(result: Any, stage: str, uri: str) -> None:
+    """Reject corrupt terminal artifacts rather than treating them as source failures."""
+    if not isinstance(result, dict) or result.get("status") not in {"succeeded", "failed"}:
+        raise ValueError(f"Invalid {stage} result for {uri}")
+    if result["status"] == "failed":
+        if (
+            result.get("dataset_uri") != uri
+            or result.get("stage") != stage
+            or not all(isinstance(result.get(key), str) for key in ("reason", "operation", "url", "category"))
+            or not isinstance(result.get("retry"), bool)
+        ):
+            raise ValueError(f"Incomplete {stage} failure result for {uri}")
+    elif stage == "dataportalen":
+        if not isinstance(result.get("documents", result.get("row")), (list, dict)):
+            raise ValueError(f"Incomplete Dataportalen result for {uri}")
+    elif result.get("outcome") not in {"eligible", "unavailable", "unresolved", "excluded"}:
+        raise ValueError(f"Incomplete Researchdata result for {uri}")
+
+
 class Config(BaseModel):
     """Operational settings; sizes are bytes and durations are seconds."""
 
@@ -149,7 +197,9 @@ class Http(httpx.AsyncClient):
                                 async for chunk in incoming.aiter_bytes():
                                     content.extend(chunk)
                                     if len(content) > self.config.verification_bytes:
-                                        raise ValueError("Metadata response exceeds configured byte limit")
+                                        raise RecordError(
+                                            "Metadata response exceeds configured byte limit", url=str(url)
+                                        )
                                 headers = dict(incoming.headers)
                                 headers.pop("content-encoding", None)
                                 headers.pop("content-length", None)

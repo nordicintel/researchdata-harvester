@@ -14,7 +14,7 @@ from typing import Any
 
 import duckdb
 
-from harvester.runtime import read_json, write_json
+from harvester.runtime import read_json, record_key, validate_result, write_json
 from harvester.vocabulary import PREDICATE_COLUMNS, RdfCache
 
 SCHEMA = Path(__file__).with_name("schema.sql")
@@ -192,9 +192,41 @@ def build(
         if uri not in dataportalen_results or uri not in researchdata_results:
             raise ValueError(f"Incomplete required stage results for {uri}")
         dp, rd = dataportalen_results[uri], researchdata_results[uri]
-        if dp.get("error") or rd.get("error"):
-            raise ValueError(f"Failed required stage for {uri}")
+        validate_result(dp, "dataportalen", uri)
+        validate_result(rd, "researchdata", uri)
         item = inventory["entries"][uri]
+        item["stages"] = {
+            stage: {"status": result["status"], "retry": bool(result.get("retry")), "reason": result.get("reason")}
+            for stage, result in (("dataportalen", dp), ("researchdata", rd))
+        }
+        item["retry"] = any(result.get("retry", False) for result in (dp, rd))
+        if dp["status"] == "failed" or rd["status"] == "failed":
+            previous = old_inventory["entries"].get(uri, {})
+            for key in ("researchdata", "association_fingerprint", "cache_references", "sources", "published_keys"):
+                if key in previous:
+                    item[key] = deepcopy(previous[key])
+            if rd["status"] == "succeeded":
+                for key in ("researchdata", "sources"):
+                    if key in rd:
+                        item[key] = deepcopy(rd[key])
+                if rd.get("researchdata"):
+                    item["association_fingerprint"] = item["fingerprint"]
+            item["failures"] = [result for result in (dp, rd) if result["status"] == "failed"]
+            item["cache_references"] = sorted(
+                set(item.get("cache_references", []))
+                | {key for result in (dp, rd) for key in result.get("cache_references", [])}
+            )
+            item["reason"] = "; ".join(result["reason"] for result in item["failures"])
+            item["outcome"] = "unavailable" if uri in rows["datasets"] else "unresolved"
+            if uri in rows["datasets"]:
+                retained = rows["datasets"][uri]
+                retained["availability"] = "unavailable"
+                for source in retained.get("sources", []):
+                    source.update(stale=True, outcome="unavailable")
+                for resource in retained["resources"]:
+                    resource.update(outcome="unavailable", reason="Metadata refresh failed")
+            continue
+        item.pop("failures", None)
         item.update(
             {
                 key: rd[key]
@@ -240,6 +272,10 @@ def build(
             }
         )
         rows["dataportalen"][uri] = dp_row
+        item["published_keys"] = dict(old_inventory["entries"].get(uri, {}).get("published_keys", {}))
+        item["published_keys"]["dataportalen"] = record_key(plan, item)
+        if rd.get("outcome") == "eligible":
+            item["published_keys"]["researchdata"] = record_key(plan, item)
         item["cache_references"] = sorted(set(item.get("cache_references", [])) | set(dp.get("cache_references", [])))
     for item in inventory["entries"].values():
         item.pop("metadata", None)
@@ -362,6 +398,8 @@ def replace(candidate: Path, destination: Path) -> None:
     """Replace one validated generation while retaining crash recovery until success."""
     validate(candidate)
     recover(destination)
+    if destination.exists() and any(destination.iterdir()):
+        validate(destination)
     pending = destination.with_name(destination.name + ".pending")
     previous = destination.with_name(destination.name + ".previous")
     if pending.exists():

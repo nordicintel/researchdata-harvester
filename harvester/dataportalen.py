@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from harvester.runtime import Config, Http, fingerprint
+from harvester.runtime import Config, Http, RecordError, fingerprint
 from harvester.vocabulary import NAMESPACES, RdfCache, normalize_rdf
 
 logger = logging.getLogger(__name__)
@@ -204,10 +204,29 @@ async def metadata(http: Http, config: Config, record: dict[str, Any], cache: Rd
                     visited.add(uri)
 
                     def decode(response: Any) -> dict[str, Any]:
-                        body = response.json()
-                        children = body["resource"]["children"]
+                        try:
+                            body = response.json()
+                            children = body["resource"]["children"]
+                            if not isinstance(children, list) or not isinstance(body["results"], int):
+                                raise ValueError("Invalid entity lookup shape")
+                            for child in children:
+                                if not isinstance(child, dict) or not isinstance(child.get("metadata"), dict):
+                                    raise ValueError("Invalid entity metadata")
+                                for predicates in child["metadata"].values():
+                                    if not isinstance(predicates, dict):
+                                        raise ValueError("Invalid RDF subject")
+                                    for terms in predicates.values():
+                                        if not isinstance(terms, list) or any(
+                                            not isinstance(term, dict)
+                                            or not isinstance(term.get("value"), str)
+                                            or term.get("type") not in {"uri", "literal", "bnode"}
+                                            for term in terms
+                                        ):
+                                            raise ValueError("Invalid RDF objects")
+                        except (ValueError, KeyError, TypeError) as error:
+                            raise RecordError("Malformed entity metadata", url=str(response.url)) from error
                         if body["results"] != len(children):
-                            raise ValueError("Related entity lookup is incomplete")
+                            raise RecordError("Related entity lookup is incomplete", url=str(response.url), retry=True)
                         merged: dict[str, Any] = {}
                         for child in children:
                             for subject, predicates in child["metadata"].items():
@@ -240,5 +259,8 @@ async def metadata(http: Http, config: Config, record: dict[str, Any], cache: Rd
                             documents.append({"url": source_url, "metadata": entry.data})
                             break
     for document in documents:
-        document["properties"] = normalize_rdf(document["metadata"], document["url"])
+        try:
+            document["properties"] = normalize_rdf(document["metadata"], document["url"])
+        except ValueError as error:
+            raise RecordError("Malformed RDF metadata", url=document["url"]) from error
     return {**record, "documents": documents, "cache_references": sorted(visited)}

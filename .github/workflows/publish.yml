@@ -50,4 +50,5 @@ jobs:
           name: harvest-report
           path: data/work/action/report.json
           retention-days: 1
+          overwrite: true
           if-no-files-found: warn

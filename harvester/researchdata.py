@@ -16,9 +16,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urljoin, urlsplit
+from xml.etree.ElementTree import ParseError
 
 import duckdb
 import httpx
+from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring
 from openpyxl.utils.exceptions import InvalidFileException
 from pyld.jsonld import JsonLdError
@@ -26,7 +28,7 @@ from pyreadstat import ReadstatError
 from xlrd.biffh import XLRDError
 
 from harvester.dataportalen import DCT
-from harvester.runtime import Config, Http, safe_url
+from harvester.runtime import Config, Http, RecordError, safe_url
 from harvester.vocabulary import IDENTITY_PREDICATES, CacheFetchError, RdfCache, SemanticResolver
 
 logger = logging.getLogger(__name__)
@@ -178,7 +180,10 @@ def decode(response: httpx.Response) -> dict[str, Any]:
     ):
         return {"document": {"downloadURL": str(response.url)}, "links": []}
     if "xml" in content_type or response.text.lstrip().startswith("<?xml"):
-        root = fromstring(response.content)
+        try:
+            root = fromstring(response.content)
+        except (ParseError, DefusedXmlException) as error:
+            raise RecordError("Malformed XML metadata", url=str(response.url)) from error
         errors = [node for node in root.iter() if local(node.tag) == "error"]
         if errors:
             raise ValueError("OAI metadata error: " + str(errors[0].attrib.get("code", "unknown")))
@@ -603,7 +608,7 @@ async def harvest(
         for item in structured:
             try:
                 if resolver is not None:
-                    resolved = await resolver.resolve(item, source_url=source_url, required=required_metadata)
+                    resolved = await resolver.resolve(item, source_url=source_url, required=False)
                 else:
                     async with SemanticResolver(
                         cache_path, http, updates_path, cache=cache, full=full
@@ -620,7 +625,9 @@ async def harvest(
                 documents.append({"url": source_url, "metadata": item, "properties": resolved.properties, "json": True})
             except (ValueError, CacheFetchError, JsonLdError) as error:
                 if required_metadata:
-                    raise
+                    if isinstance(error, RecordError):
+                        raise
+                    raise RecordError(type(error).__name__, url=source_url) from error
                 sources.append(
                     {"url": source_url, "outcome": "unavailable", "stale": False, "reason": type(error).__name__}
                 )

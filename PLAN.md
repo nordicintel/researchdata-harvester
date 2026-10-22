@@ -400,7 +400,7 @@ Share repeated entity lookups within the worker. Revalidate mutable cached entit
 
 Preserve all source assertions, including unknown predicates and conflicting descriptions. Typed projections must not replace the complete property representation.
 
-Required Dataportalen retrieval failures prevent publication.
+Expected per-record Dataportalen retrieval failures produce saved failed-stage outcomes and do not stop either fetch workflow. Retain a previous record pair as stale/unavailable, or leave a new failed record in inventory only. Required inventory failures still prevent publication.
 
 ### 4.3 Researchdata identities and metadata
 
@@ -457,7 +457,7 @@ For optional external failures:
 - Continue other records.
 - Retry transient failures on the next run.
 
-Malformed optional external documents are explicit unresolved outcomes. Malformed required source metadata blocks publication.
+Malformed individual source documents are explicit failed or unresolved record outcomes. Malformed required inventory documents block publication. Catch known parser exceptions at their parsing boundaries; unexpected programming errors remain fatal.
 
 Unexpected programming errors must fail visibly with dataset context rather than being converted into ordinary external failures.
 
@@ -759,7 +759,7 @@ Before publication, check:
 - Cache references retained for unchanged records as well as refreshed ones.
 - Counts and checksums matching actual files.
 - No unsupported partial/scoped generation marked as complete.
-- No required-source failure hidden inside an otherwise completed artifact.
+- Every selected identity has valid terminal results for both stages, including explicit failure details. Missing or malformed artifacts remain fatal.
 
 Run the existing `publication_errors` view and reject any returned rows.
 
@@ -1017,7 +1017,7 @@ The publication workflow:
 3. Builds the candidate.
 4. Runs complete offline candidate validation.
 5. Confirms the run has full catalog coverage.
-6. Confirms no required-source failure occurred.
+6. Confirms inventory coverage and terminal results are complete, records individual failures and rejects any run-wide failure.
 7. Confirms remote `main` still equals the expected base commit.
 8. Stages only generated current data.
 9. Creates one data-only commit when content changed.
@@ -1140,7 +1140,7 @@ The essential scenarios must demonstrate:
 - Verification of observations rather than metadata.
 - Byte limits, interrupted responses and access restrictions.
 - Retention of prior successful data after optional external failure.
-- Rejection of publication after required-source failure.
+- Publication with explicit individual failures retains prior pairs and defers new records; inventory or artifact failures block publication.
 - Matching table membership and deterministic output.
 - Two Parquet files when both tables fit.
 - Rejection of scoped or outdated publication candidates.
@@ -1188,7 +1188,7 @@ The implementation is complete when:
 - Complete source properties and provenance survive normalization.
 - Confirmed associations are reused and invalidated correctly.
 - Optional external failures retain prior metadata with explicit stale outcomes.
-- Required-source failures leave the published generation unchanged.
+- Required inventory failures leave the published generation unchanged. Individual required-source failures retain previous verified pairs or defer new records while other results publish.
 - Scoped runs cannot remove production records or publish.
 - Interrupted work can reuse valid completed temporary results.
 - An unchanged incremental run causes no duplicate growth or unnecessary source retrieval.
@@ -1266,3 +1266,18 @@ Replace the current placeholder with a self-contained operating guide covering:
 Keep changing catalog counts and lengthy dated acceptance narratives out of the README.
 
 The final repository must have one active execution path, two well-defined data tables, a reusable semantic cache, and enough diagnostics to resolve a failed record without restarting an unbounded full-catalog scrape.
+
+
+## Isolated failure recovery
+
+This policy supersedes blanket per-record fail-fast requirements. Use the existing HTTP retries, record artifacts, inventory and workflows. Add no files, dependencies, queue or persistent checkpoints.
+
+Each stage result has status `succeeded` or `failed`. Failure results include dataset URI, stage, operation, redacted resource URL, category, reason and retryability. Persist every terminal result atomically. Expected source errors must not cancel sibling records. Unknown exceptions, process cancellation, configuration errors, incomplete inventories, corrupt artifacts and invalid output remain fatal.
+
+Retry transient record failures on the next normal run after the existing bounded HTTP attempts are exhausted. Stable failures retry after relevant input changes or `--full`. Canonical input keys exclude processing outcomes and use portable source paths. Persist stage-specific outcomes, retry flags and published-stage fingerprints in inventory. Reuse matching successful artifacts independently of the failed stage; after expiry, reuse a valid matching published row or retrieve the metadata needed to construct a complete replacement pair. Preserve successful shared cache entries, with no partial normalization from failed documents.
+
+Required individual refresh failures retain an existing pair, successful verification, associations and cache references. Mark it stale/unavailable. New incomplete records remain inventory-only. Explicit membership removal or exclusion takes precedence. Never admit half a pair. Manifest `complete` describes inventory coverage and complete accounting, not universal retrieval success. Publish inventory-only retry updates.
+
+Fetch workflow reruns restore completed same-run artifacts and overwrite same-name uploads. Only an absent optional recovery artifact may fall back to retrieval. Do not hide fetch/build failures using blanket `continue-on-error`. Keep diagnostics and one-day artifact retention. Report per-stage successes, failures, retryable outcomes, stale retention and newly deferred records.
+
+Acceptance covers both fetch stages exhausting real HTTP retries while other records finish, targeted recovery, stable parser failures, programming-error propagation, corrupt-artifact rejection, successful counterpart reuse, cache safety, paired retention and mixed-success publication against a Git remote. Run Ruff, formatting, mypy, Pyright and default pytest, then live scoped verification and the coordinated workflow. Commit code and generated data separately.

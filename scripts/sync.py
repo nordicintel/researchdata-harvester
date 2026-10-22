@@ -14,8 +14,22 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
+from pyld.jsonld import JsonLdError
+
 from harvester import dataportalen, output, researchdata
-from harvester.runtime import Config, Http, fingerprint, read_json, write_json
+from harvester.runtime import (
+    Config,
+    Http,
+    RecordError,
+    fingerprint,
+    read_json,
+    record_key,
+    safe_url,
+    transient,
+    validate_result,
+    write_json,
+)
 from harvester.vocabulary import RdfCache, SemanticResolver
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,7 +63,7 @@ def read_cache(path: Path) -> dict[str, Any]:
 def implementation() -> str:
     return fingerprint(
         {
-            str(path.relative_to(ROOT)): path.read_text(encoding="utf-8-sig")
+            path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8-sig")
             for directory in (ROOT / "harvester", ROOT / "scripts")
             for path in sorted(directory.iterdir())
             if path.suffix in {".py", ".sql"}
@@ -66,6 +80,8 @@ async def fetch(
     gate = asyncio.Semaphore(config.concurrency)
     directory = work / stage
     directory.mkdir(parents=True, exist_ok=True)
+    prior = read_json(current / "inventory.json", {"entries": {}})["entries"]
+    published: dict[str, Any] | None = None
     completed = sorted((read_json(path).get("sequence", 0), path) for path in directory.glob("*.json"))
     for _, path in completed:
         cache.merge(read_json(path).get("cache_updates", {}))
@@ -90,21 +106,58 @@ async def fetch(
         )
 
         async def record(uri: str) -> None:
-            nonlocal sequence
+            nonlocal sequence, published
             async with gate:
                 entry = plan["entries"][uri]
                 artifact = directory / (fingerprint(uri) + ".json")
-                key = fingerprint([plan["implementation"], plan["configuration"], entry, plan.get("full")])
+                key = record_key(plan, entry)
                 previous = read_json(artifact)
-                if previous and previous.get("key") == key and not previous["result"].get("retry"):
+                if previous:
+                    validate_result(previous.get("result"), stage, uri)
+                if (
+                    previous
+                    and previous.get("key") == key
+                    and not previous["result"].get("retry")
+                    and (not plan["full"] or previous["result"]["status"] == "succeeded")
+                ):
                     results[uri] = previous["result"]
                     logger.info("%s reused %s", stage, uri)
                     return
+                before = prior.get(uri, {})
+                stage_state = before.get("stages", {}).get(stage, {})
+                if (
+                    not plan["full"]
+                    and before.get("published_keys", {}).get(stage) == key
+                    and stage_state.get("status") == "succeeded"
+                    and not stage_state.get("retry")
+                ):
+                    if published is None:
+                        manifest = output.validate(current)
+                        table = "dataportalen" if stage == "dataportalen" else "datasets"
+                        published = output.load_rows(current, table, manifest)
+                    if uri in published and (stage == "dataportalen" or published[uri]["availability"] == "available"):
+                        row = published[uri]
+                        result = {
+                            "status": "succeeded",
+                            "row": row,
+                            "cache_references": before.get("cache_references", []),
+                        }
+                        if stage == "researchdata":
+                            result.update({key: row[key] for key in ("resources", "researchdata", "sources")})
+                            result.update(outcome="eligible", retry=False)
+                        results[uri] = result
+                        logger.info("%s reused published dataset=%s", stage, uri)
+                        return
                 try:
                     dp = await dataportalen.metadata(http, config, entry, cache)
                     if stage == "dataportalen":
                         for document in dp["documents"]:
-                            normalized = await resolver.resolve(document["metadata"], source_url=document["url"])
+                            try:
+                                normalized = await resolver.resolve(
+                                    document["metadata"], source_url=document["url"], required=False
+                                )
+                            except ValueError as error:
+                                raise RecordError(type(error).__name__, url=document["url"]) from error
                             document["properties"] = normalized.properties
                         result = dp
                     else:
@@ -118,23 +171,47 @@ async def fetch(
                             full=plan["full"],
                             resolver=resolver,
                         )
-                    results[uri] = result
-                    sequence += 1
-                    write_json(
-                        artifact, {"key": key, "result": result, "sequence": sequence, "cache_updates": cache.changes()}
+                    result["status"] = "succeeded"
+                except (RecordError, httpx.HTTPError, JsonLdError) as error:
+                    url = (
+                        error.url
+                        if isinstance(error, RecordError)
+                        else (
+                            safe_url(str(error.request.url))
+                            if isinstance(error, httpx.HTTPError) and error.request
+                            else ""
+                        )
                     )
-                    cache.mark_saved()
-                    logger.info(
-                        "%s %d/%d %s outcome=%s",
-                        stage,
-                        len(results),
-                        len(plan["selected"]),
-                        uri,
-                        result.get("outcome", "retrieved"),
-                    )
+                    retry = error.retry if isinstance(error, RecordError) else transient(error)
+                    reason = str(error) if isinstance(error, RecordError) else type(error).__name__
+                    result = {
+                        "status": "failed",
+                        "dataset_uri": uri,
+                        "stage": stage,
+                        "operation": "retrieve_metadata",
+                        "url": url,
+                        "category": type(error).__name__,
+                        "reason": reason,
+                        "retry": retry,
+                    }
+                    logger.warning("%s dataset=%s reason=%s retry=%s", stage, uri, reason, retry)
                 except Exception:
                     logger.exception("%s failed dataset=%s", stage, uri)
                     raise
+                results[uri] = result
+                validate_result(result, stage, uri)
+                sequence += 1
+                write_json(
+                    artifact,
+                    {
+                        "key": key,
+                        "result": result,
+                        "sequence": sequence,
+                        "cache_updates": cache.changes(),
+                    },
+                )
+                cache.mark_saved()
+                logger.info("%s %d/%d %s status=%s", stage, len(results), len(plan["selected"]), uri, result["status"])
 
         async with asyncio.TaskGroup() as tasks:
             for uri in plan["selected"]:
@@ -156,6 +233,23 @@ async def fetch(
             "failures": http.failures,
             "elapsed_seconds": time.monotonic() - http.started,
         }
+        payload["outcomes"] = dict(Counter(item["status"] for item in results.values()))
+        payload["retryable"] = sum(bool(item.get("retry")) for item in results.values())
+        payload["retained_stale"] = sum(
+            (item["status"] == "failed" or item.get("outcome") in {"unavailable", "unresolved"})
+            and prior.get(uri, {}).get("outcome") in {"eligible", "unavailable"}
+            for uri, item in results.items()
+        )
+        payload["newly_deferred"] = sum(
+            item["status"] == "failed" and prior.get(uri, {}).get("outcome") not in {"eligible", "unavailable"}
+            for uri, item in results.items()
+        )
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                summary.write(
+                    f"### {stage}\n{json.dumps(payload['outcomes'])}; retryable: {payload['retryable']}; "
+                    f"retained stale: {payload['retained_stale']}; newly deferred: {payload['newly_deferred']}\n"
+                )
         write_json(work / (stage + ".json"), payload)
         return payload
 
@@ -181,6 +275,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     code_hash = implementation()
     with output.lock(current):
         output.recover(current)
+        if current.exists() and any(current.iterdir()) and not (current / "manifest.json").exists():
+            raise ValueError(
+                "Nonempty destination has no manifest; choose an empty directory or a valid current generation"
+            )
         if args.stage in {"all", "inventory"}:
             prior = read_json(current / "inventory.json", {"entries": {}})
             if (current / "manifest.json").exists():
@@ -216,16 +314,20 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "has_changes": plan["has_changes"],
             }
         if args.stage == "all" and not plan["has_changes"]:
-            return {
+            report = {
                 "outcome": "unchanged",
                 "requests": plan["inventory_requests"],
                 "elapsed_seconds": time.monotonic() - started,
             }
+            write_json(args.report or work / "report.json", report)
+            return report
         if args.stage in {"dataportalen", "researchdata"}:
             stage_result = await fetch(args.stage, plan, config, work, current)
             return {
                 "stage": args.stage,
                 "records": len(stage_result["results"]),
+                "outcomes": stage_result["outcomes"],
+                "retryable": stage_result["retryable"],
                 "requests": stage_result["requests"],
                 "elapsed_seconds": stage_result["elapsed_seconds"],
             }
@@ -258,6 +360,22 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "unchanged": len(plan["entries"]) - len(plan["selected"]),
             "reasons": dict(
                 Counter(item.get("reason") for item in inventory_state["entries"].values() if item.get("reason"))
+            ),
+            "stages": {
+                stage: {
+                    **artifact["outcomes"],
+                    **{key: artifact[key] for key in ("retryable", "retained_stale", "newly_deferred")},
+                }
+                for stage, artifact in (("dataportalen", dp), ("researchdata", rd))
+            },
+            "stage_failures": {
+                stage: [item for item in artifact["results"].values() if item.get("status") == "failed"]
+                for stage, artifact in (("dataportalen", dp), ("researchdata", rd))
+            },
+            "retained_stale": sum(item.get("outcome") == "unavailable" for item in inventory_state["entries"].values()),
+            "newly_deferred": sum(
+                bool(item.get("failures")) and item.get("outcome") == "unresolved"
+                for item in inventory_state["entries"].values()
             ),
             "retry_required": sum(bool(item.get("retry")) for item in inventory_state["entries"].values()),
             "outcomes": dict(Counter(item.get("outcome", "pending") for item in inventory_state["entries"].values())),

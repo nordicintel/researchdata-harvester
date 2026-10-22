@@ -391,6 +391,18 @@ async def test_resolver_failure_boundaries(tmp_path: Path) -> None:
                     source_url="https://data.example/source",
                 )
         assert not failed.exists()
+        partial = tmp_path / "partial.gz"
+        async with SemanticResolver(baseline, client, partial) as resolver:
+            good = await resolver.resolve(metadata, source_url="https://data.example/source", required=False)
+            with pytest.raises(Exception, match="context"):
+                await resolver.resolve(
+                    {"@context": "https://missing.example/context", "name": "test"},
+                    source_url="https://data.example/broken",
+                    required=False,
+                )
+            assert good.properties[0]["value"] == "preserved"
+        assert partial.exists()
+        assert json.loads(gzip.decompress(partial.read_bytes()))
         aborted = tmp_path / "aborted.gz"
         with pytest.raises(RuntimeError, match="abort"):
             async with SemanticResolver(baseline, client, aborted) as resolver:

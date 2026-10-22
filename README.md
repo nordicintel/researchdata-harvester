@@ -42,7 +42,11 @@ A new dataset must yield columns and an observation row. Public metadata, HTTP 2
 
 Verification supports CSV/TSV, flat JSON observations, XLSX, XLS, supported statistical files and Parquet, including gzip wrappers. Generic archives, documents, imagery, map layers and APIs with unknown selectors remain unresolved. At most 100 rows and 32 MiB of transferred/decompressed content are inspected per resource. Verification stops after the first successful resource establishes dataset eligibility; every remaining advertised resource stays in metadata with an explicit unverified outcome.
 
-Required-source failures prevent publication. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Confirmed Researchdata associations stay in the inventory and are reused only while their supporting metadata fingerprint still matches. Verification does not establish redistribution rights.
+Required inventory failures prevent publication. Expected failures retrieving or parsing an individual dataset become saved stage outcomes, so both fetch workflows continue with other datasets. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Confirmed Researchdata associations stay in the inventory and are reused only while their supporting metadata fingerprint still matches. Verification does not establish redistribution rights.
+
+The builder retains an existing pair after a required record refresh fails, preserving its verification and marking metadata stale/unavailable. New failed datasets stay in inventory only. Inventory stores stage-specific retry decisions, the newly observed registry modification value and the fingerprint of each published stage. Confirmed removal or exclusion still removes both rows. Missing results, corrupt artifacts, incomplete inventory, unexpected programming errors and invalid output fail the run. Cancellation propagates and leaves completed artifacts reusable.
+
+Manifest `complete` means inventory coverage is complete and every selected entry has a documented result. It does not mean every refresh succeeded. The report and inventory expose failed and stale records. Inventory-only changes can be published.
 
 ## Scoped execution and recovery
 
@@ -55,7 +59,7 @@ uv run python -m scripts.sync --dataset-uri "https://doi.org/10.5878/d4bn-b702" 
 
 Use `--config config.local.toml` for an ignored complete alternative configuration. Configured paths resolve relative to the TOML file; CLI paths resolve relative to the working directory. `--report data/work/report.json` selects the report path.
 
-Reuse a work directory after interruption. Completed record artifacts are reusable only when inputs, configuration and implementation fingerprints agree. Each artifact saves its new cache entries; the worker replays these in completion order after interruption and compresses the complete cache at stage boundaries. Pagination restarts. Use another work directory after a completed candidate build.
+Reuse a work directory after interruption. Failed transient records retry on the next run, using the existing bounded HTTP policy of three attempts and a total operation deadline. Stable failures retry after source change or `--full`. Successful counterpart artifacts are reused when source, configuration and implementation fingerprints match. If artifacts have expired, a matching published stage row can be reused; otherwise the metadata needed for a complete replacement pair is retrieved. Completed record artifacts are reusable only when inputs, configuration and implementation fingerprints agree. Each artifact saves its new cache entries; the worker replays these in completion order after interruption and compresses the complete cache at stage boundaries. Pagination restarts. Use another work directory after a completed candidate build.
 
 ```sh
 uv run python -m scripts.sync --stage inventory --work-directory data/work/run
@@ -66,7 +70,7 @@ uv run python -m scripts.sync --stage build --work-directory data/work/run
 
 Fetch stages write artifacts; build writes a candidate without replacing production. Interrupted directory replacement recovers automatically. A lock filename alone does not establish a running process. Do not delete lock/replacement directories as routine recovery.
 
-INFO logs show progress. DEBUG adds redacted requests, attempts, cache decisions and parser outcomes. Reports contain counts, reasons, requests, timing and output sizes. Credentials, raw response bodies and observation values are not logged.
+INFO logs show progress. DEBUG adds redacted requests, attempts, cache decisions and parser outcomes. Reports contain per-stage success/failure and retry counts, redacted failure details, retained-stale and newly deferred counts, requests, timing and output sizes. Each failed record identifies its dataset, stage, operation, URL, category, reason and retryability. Credentials, raw response bodies and observation values are not logged.
 
 ## Output and semantic definitions
 
@@ -144,6 +148,8 @@ Change endpoints only for an intentional source migration or test. Lower concurr
 
 ## GitHub operation
 
+Fetch workflows restore completed same-run artifacts on a rerun and replace their uploaded artifacts. Artifacts expire after one day; published inventory retains retry decisions. Expected record failures do not fail a job. Run-wide failures still prevent publication, and diagnostic artifacts remain available.
+
 Harvest runs daily at **03:17 UTC**. Use **Actions > Harvest > Run workflow** for a manual run and its full-refresh option.
 
 Inventory feeds two reusable fetch workflows in parallel. Publication waits for both, validates the candidate and publishes only generated current data directly to `main`. Artifacts expire after one day. Runs are serialized without cancelling active work. Fetch jobs are read-only; only publication receives write permission.
@@ -179,7 +185,9 @@ Use English names, annotations and useful Google-style docstrings. Ruff uses 120
 
 | Problem | Action |
 |---|---|
-| Required source failure or inventory disagreement | Inspect the report/log, correct the issue and rerun. Published state remains unchanged. |
+| Inventory disagreement | Publication stops. Correct the source disagreement and rerun. |
+| Individual dataset failure | Other datasets continue. Inspect its saved stage outcome; transient failures retry automatically. Existing rows remain stale/unavailable and new failed records remain inventory-only. |
+| Corrupt artifacts or unexpected programming error | The job fails. Inspect the traceback and artifacts; do not hide it as an ordinary source outcome. |
 | External source failure | Inspect its outcome; prior metadata may remain stale and transient failures retry. |
 | Invalid configuration | Correct the named setting before network work. |
 | Checksum failure | Restore a consistent generation; do not rewrite checksums to conceal corruption. |

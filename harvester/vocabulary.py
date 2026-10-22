@@ -106,6 +106,8 @@ from referencing._core import Resolver
 from referencing.exceptions import Unresolvable
 from referencing.jsonschema import DRAFT202012
 
+from harvester.runtime import RecordError, transient
+
 # ------------------------------------------------------------------------------
 # Namespaces and normalization projections
 # ------------------------------------------------------------------------------
@@ -280,6 +282,7 @@ class CacheEntry(BaseModel):
     last_modified: str | None = None
     outcome: Literal["available", "unavailable"] = "available"
     error: str | None = None
+    retry: bool = False
 
     @model_validator(mode="after")
     def require_available_data(self) -> "CacheEntry":
@@ -294,8 +297,8 @@ class CacheEntry(BaseModel):
         return self.outcome == "unavailable" and self.data is not None
 
 
-class CacheFetchError(RuntimeError):
-    """A required source could not be refreshed; publication must not proceed."""
+class CacheFetchError(RecordError):
+    """A required document could not be refreshed; its record is incomplete."""
 
 
 _ENTRIES = TypeAdapter(dict[str, CacheEntry])
@@ -374,6 +377,7 @@ class RdfCache:
                             update={
                                 "outcome": "available",
                                 "error": None,
+                                "retry": False,
                                 "etag": response.headers.get("etag", previous.etag),
                                 "last_modified": response.headers.get("last-modified", previous.last_modified),
                             }
@@ -390,21 +394,45 @@ class RdfCache:
                             last_modified=response.headers.get("last-modified"),
                         )
                     logger.debug("RDF cache refresh: HTTP %s", response.status_code)
-                except (httpx.HTTPError, ValueError) as error:
+                except (httpx.HTTPError, ValueError, RecordError) as error:
                     reason = (
                         f"HTTP {error.response.status_code}"
                         if isinstance(error, httpx.HTTPStatusError)
                         else type(error).__name__
                     )
                     entry = (previous or CacheEntry(kind=kind, source_url=url, outcome="unavailable")).model_copy(
-                        update={"outcome": "unavailable", "error": reason}
+                        update={
+                            "outcome": "unavailable",
+                            "error": reason,
+                            "retry": error.retry if isinstance(error, RecordError) else transient(error),
+                        }
                     )
                     logger.debug("RDF cache refresh failed: %s", reason)
                 self._entries[uri] = entry
                 self._fetched[uri] = url
             entry = self._entries[uri]
             if required and entry.outcome != "available":
-                raise CacheFetchError(f"Required RDF resource {uri}: {entry.error}")
+                raise CacheFetchError(
+                    entry.error or "Metadata unavailable",
+                    url=url,
+                    retry=entry.retry
+                    or entry.error
+                    in {
+                        "ConnectTimeout",
+                        "ReadTimeout",
+                        "WriteTimeout",
+                        "PoolTimeout",
+                        "ConnectError",
+                        "ReadError",
+                        "WriteError",
+                        "RemoteProtocolError",
+                        "HTTP 429",
+                        "HTTP 500",
+                        "HTTP 502",
+                        "HTTP 503",
+                        "HTTP 504",
+                    },
+                )
             return entry.model_copy(deep=True)
 
     def changes(self) -> dict[str, dict[str, JsonValue]]:

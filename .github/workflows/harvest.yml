@@ -40,6 +40,7 @@ jobs:
           name: inventory
           path: data/work/action/inventory.json
           retention-days: 1
+          overwrite: true
   dataportalen:
     needs: inventory
     if: needs.inventory.outputs.has_changes == 'true'
