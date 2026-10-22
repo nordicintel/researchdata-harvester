@@ -245,6 +245,11 @@ async def test_fetch_contains_expected_failures_and_reuses_completed_records(tmp
     refreshed = await sync.fetch("dataportalen", plan, Config(), tmp_path / "work", tmp_path / "current")
     assert refreshed["outcomes"] == {"succeeded": 2}
     assert calls == ["good", "bad", "bad", "good"]
+    plan.update(full=True, plan_id="explicit-full-refresh")
+    await sync.fetch("dataportalen", plan, Config(), tmp_path / "work", tmp_path / "current")
+    assert calls == ["good", "bad", "bad", "good", "good", "bad"]
+    await sync.fetch("dataportalen", plan, Config(), tmp_path / "work", tmp_path / "current")
+    assert calls == ["good", "bad", "bad", "good", "good", "bad"]
 
     async def broken(*args: Any, **kwargs: Any) -> Any:
         raise KeyError("programming defect")

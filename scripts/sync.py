@@ -118,7 +118,10 @@ async def fetch(
                     previous
                     and previous.get("key") == key
                     and not previous["result"].get("retry")
-                    and (not plan["full"] or previous["result"]["status"] == "succeeded")
+                    and (
+                        not plan["full"]
+                        or (previous.get("plan_id") == plan["plan_id"] and previous["result"]["status"] == "succeeded")
+                    )
                 ):
                     results[uri] = previous["result"]
                     logger.info("%s reused %s", stage, uri)
@@ -205,6 +208,7 @@ async def fetch(
                     artifact,
                     {
                         "key": key,
+                        "plan_id": plan["plan_id"],
                         "result": result,
                         "sequence": sequence,
                         "cache_updates": cache.changes(),
