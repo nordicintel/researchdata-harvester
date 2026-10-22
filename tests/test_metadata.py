@@ -483,3 +483,52 @@ def test_rdf_unicode_line_separators_preserve_literal_values() -> None:
         "https://example.org/dataset": {"http://purl.org/dc/terms/description": [{"type": "literal", "value": text}]}
     }
     assert normalize_rdf(document, "https://example.org/metadata")[0]["value"] == text
+
+
+async def test_harvest_normalizes_own_doi_without_following_cited_datasets(tmp_path: Path) -> None:
+    from harvester.researchdata import harvest
+    from harvester.runtime import Config, Http
+    from harvester.vocabulary import RdfCache
+
+    uri = "https://catalog.example/dataset/one"
+    graph = {
+        uri: {
+            "http://www.w3.org/ns/dcat#downloadURL": [
+                {"type": "uri", "value": "https://data.example/a.csv"},
+                {"type": "uri", "value": "https://data.example/b.csv"},
+            ],
+            "http://purl.org/dc/terms/identifier": [{"type": "literal", "value": "doi:10.1234/OWN"}],
+            "http://purl.org/dc/terms/description": [
+                {"type": "literal", "value": "Other work [Data set] https://doi.org/10.9876/unrelated"}
+            ],
+        }
+    }
+    requested = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.path.endswith(".csv"):
+            return httpx.Response(200, text="station,temperature\nA,12\n", headers={"Content-Type": "text/csv"})
+        return httpx.Response(200, json={"name": "Source metadata"})
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client,
+        Http(Config(), client=client) as http,
+    ):
+        result = await harvest(
+            http,
+            Config(),
+            {
+                "dataset_uri": uri,
+                "metadata_url": uri,
+                "metadata": graph,
+                "documents": [{"url": uri, "metadata": graph}],
+            },
+            RdfCache(),
+            tmp_path / "cache.gz",
+            tmp_path / "updates.gz",
+        )
+    assert requested == ["https://doi.org/10.1234/own", "https://data.example/a.csv"]
+    assert result["outcome"] == "eligible"
+    assert len(result["resources"]) == 2
+    assert result["resources"][1]["verification"] is None

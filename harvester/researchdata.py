@@ -27,7 +27,7 @@ from xlrd.biffh import XLRDError
 
 from harvester.dataportalen import DCT
 from harvester.runtime import Config, Http, safe_url
-from harvester.vocabulary import CacheFetchError, RdfCache, SemanticResolver
+from harvester.vocabulary import IDENTITY_PREDICATES, CacheFetchError, RdfCache, SemanticResolver
 
 logger = logging.getLogger(__name__)
 FILE_SUFFIXES = {".csv", ".tsv", ".xlsx", ".xls", ".sav", ".dta", ".sas7bdat", ".parquet"}
@@ -435,11 +435,19 @@ async def harvest(
     roots = record["metadata"]
     uri = record["dataset_uri"]
     pending = set().union(*(urls(doc["metadata"], {"landingPage", "accessURL"}) for doc in documents))
-    # Only explicit dataset self-citations in descriptions establish fallback links.
+    asserted = {identity(uri)}
+    for predicate in {DCT + "identifier", *IDENTITY_PREDICATES}:
+        asserted.update(identity(term["value"]) for term in roots.get(uri, {}).get(predicate, []))
+    pending.update("https://doi.org/" + value for value in asserted if re.fullmatch(r"10\.\d{4,9}/\S+", value))
+    # A description citation needs matching identity evidence, not just a dataset label.
     for text in (term["value"] for term in roots.get(uri, {}).get(DCT + "description", [])):
         for line in text.splitlines():
             if "[Data set]" in line or "[Dataset]" in line:
-                pending.update(url.rstrip(".,)") for url in re.findall(r"https?://[^\s<>]+", line))
+                pending.update(
+                    url.rstrip(".,)")
+                    for url in re.findall(r"https?://[^\s<>]+", line)
+                    if identity(url.rstrip(".,)")) in asserted
+                )
     files = set().union(*(file_urls(doc["metadata"]) for doc in documents))
     for term in roots.get(uri, {}).get(DCT + "identifier", []):
         if term["value"].startswith(("https://doi.org/", "http://doi.org/")):
@@ -580,9 +588,30 @@ async def harvest(
                 for address in urls(node, {"accessUrl", "contentUrl", "downloadURL", "content"}):
                     names[address] = name
     resources = []
-    for url in sorted(files):
-        resource = await verify(http, url, config, filename=names.get(url))
-        resource["source_url"] = record["metadata_url"]
+    eligible = False
+    for url in sorted(
+        files,
+        key=lambda value: (Path(names.get(value, urlsplit(value).path)).suffix.lower() not in {".csv", ".tsv"}, value),
+    ):
+        if eligible:
+            resource = {
+                "url": url,
+                "source_url": None,
+                "entity_id": None,
+                "distribution_id": None,
+                "filename": names.get(url, Path(urlsplit(url).path).name),
+                "outcome": "unresolved",
+                "reason": "Not sampled; another resource established eligibility",
+                "checked_at": None,
+                "verification": None,
+            }
+        else:
+            resource = await verify(http, url, config, filename=names.get(url))
+            eligible = resource["outcome"] == "verified"
+        resource["source_url"] = next(
+            (document["url"] for document in documents if url in file_urls(document["metadata"])),
+            record["metadata_url"],
+        )
         resources.append(resource)
     eligible = any(resource["outcome"] == "verified" for resource in resources)
     retry = retry or any(

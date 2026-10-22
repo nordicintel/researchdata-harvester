@@ -199,14 +199,6 @@ async def metadata(http: Http, config: Config, record: dict[str, Any], cache: Rd
                     if term["type"] != "uri" or uri in visited or uri in graph:
                         continue
                     visited.add(uri)
-                    expression = f'public:true AND resource:"{escape(uri)}"'
-                    source_url = str(
-                        http.build_request(
-                            "GET",
-                            config.search_url,
-                            params={"type": "solr", "query": expression, "limit": 100, "offset": 0, "sort": "uri asc"},
-                        ).url
-                    )
 
                     def decode(response: Any) -> dict[str, Any]:
                         body = response.json()
@@ -221,9 +213,29 @@ async def metadata(http: Http, config: Config, record: dict[str, Any], cache: Rd
                                     target.setdefault(pred, []).extend(objects)
                         return merged
 
-                    entry = await cache.fetch(uri, http, source_url=source_url, required=True, decoder=decode)
-                    if entry.data:
-                        documents.append({"url": source_url, "metadata": entry.data})
+                    for context in (config.context_url, None):
+                        expression = f'public:true AND resource:"{escape(uri)}"'
+                        if context:
+                            expression += f" AND context:{escape(context)}"
+                        cache_key = uri if context else uri + "#registry-global"
+                        visited.add(cache_key)
+                        source_url = str(
+                            http.build_request(
+                                "GET",
+                                config.search_url,
+                                params={
+                                    "type": "solr",
+                                    "query": expression,
+                                    "limit": 100,
+                                    "offset": 0,
+                                    "sort": "uri asc",
+                                },
+                            ).url
+                        )
+                        entry = await cache.fetch(cache_key, http, source_url=source_url, required=True, decoder=decode)
+                        if entry.data:
+                            documents.append({"url": source_url, "metadata": entry.data})
+                            break
     for document in documents:
         document["properties"] = normalize_rdf(document["metadata"], document["url"])
     return {**record, "documents": documents, "cache_references": sorted(visited)}

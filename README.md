@@ -40,7 +40,7 @@ Selected records independently revalidate linked mutable metadata. Unchanged dat
 
 A new dataset must yield columns and an observation row. Public metadata, HTTP 200 and file extensions are insufficient. Missing distributions are allowed when explicitly linked repositories provide data. Unspecified rights and anonymous licence acknowledgements are allowed. Accounts, API keys, payment and individual approval are excluded. Licence terms are retained without a commercial-use filter.
 
-Verification supports CSV/TSV, flat JSON observations, XLSX, XLS, supported statistical files and Parquet, including gzip wrappers. Generic archives, documents, imagery, map layers and APIs with unknown selectors remain unresolved. At most 100 rows and 32 MiB of transferred/decompressed content are inspected per resource.
+Verification supports CSV/TSV, flat JSON observations, XLSX, XLS, supported statistical files and Parquet, including gzip wrappers. Generic archives, documents, imagery, map layers and APIs with unknown selectors remain unresolved. At most 100 rows and 32 MiB of transferred/decompressed content are inspected per resource. Verification stops after the first successful resource establishes dataset eligibility; every remaining advertised resource stays in metadata with an explicit unverified outcome.
 
 Required-source failures prevent publication. External failures receive explicit outcomes; previous metadata can remain stale. Previously verified datasets retain evidence after failed refreshes with unavailable status. New unresolved/unavailable records remain in inventory only. Confirmed removal or exclusion removes both table rows. Verification does not establish redistribution rights.
 
