@@ -448,12 +448,29 @@ class RdfCache:
         self._baseline = self._entries.copy()
 
     def merge(self, *updates: Mapping[str, object]) -> None:
-        """Merge worker updates atomically; differing updates for one URI fail."""
+        """Keep successful fetches; reject conflicting successful descriptions."""
         pending = _ENTRIES.validate_python(self.changes())
         for update in updates:
             for uri, entry in _ENTRIES.validate_python(update).items():
                 if uri in pending and pending[uri] != entry:
-                    raise ValueError(f"Conflicting RDF cache updates for {uri}")
+                    other = pending[uri]
+                    if (
+                        other.source_url == entry.source_url
+                        and other.kind == entry.kind
+                        and {other.outcome, entry.outcome} == {"available", "unavailable"}
+                    ):
+                        entry = other if other.outcome == "available" else entry
+                    elif other.outcome == entry.outcome == "unavailable" and other.model_dump(
+                        exclude={"error", "retry"}
+                    ) == entry.model_dump(exclude={"error", "retry"}):
+                        entry = entry.model_copy(
+                            update={
+                                "error": min(other.error or "", entry.error or ""),
+                                "retry": other.retry or entry.retry,
+                            }
+                        )
+                    else:
+                        raise ValueError(f"Conflicting RDF cache updates for {uri}")
                 pending[uri] = entry
         self._entries.update(pending)
 

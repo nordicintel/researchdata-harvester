@@ -523,7 +523,7 @@ At build time:
 
 1. Load the published cache.
 2. Merge worker updates.
-3. Reject conflicting updates for the same cache key.
+3. Prefer successful fetches over failed worker fetches of the same resource. Reject conflicting successful descriptions for the same cache key.
 4. Remove mutable entities no longer referenced by retained output.
 5. Retain vocabulary and schema definitions for reuse.
 6. Write sorted JSON with deterministic gzip headers.
@@ -1274,7 +1274,7 @@ This policy supersedes blanket per-record fail-fast requirements. Use the existi
 
 Each stage result has status `succeeded` or `failed`. Failure results include dataset URI, stage, operation, redacted resource URL, category, reason and retryability. Persist every terminal result atomically. Expected source errors must not cancel sibling records. Unknown exceptions, process cancellation, configuration errors, incomplete inventories, corrupt artifacts and invalid output remain fatal.
 
-Retry transient record failures on the next normal run after the existing bounded HTTP attempts are exhausted. Stable failures retry after relevant input changes or `--full`. Canonical input keys exclude processing outcomes and use portable source paths. Persist stage-specific outcomes, retry flags and published-stage fingerprints in inventory. Reuse matching successful artifacts independently of the failed stage; after expiry, reuse a valid matching published row or retrieve the metadata needed to construct a complete replacement pair. Preserve successful shared cache entries, with no partial normalization from failed documents.
+Retry transient record failures on the next normal run after the existing bounded HTTP attempts are exhausted. Stable failures retry after relevant input changes or `--full`. Canonical input keys exclude processing outcomes and use portable source paths. Persist stage-specific outcomes, retry flags and published-stage fingerprints in inventory. Reuse matching successful artifacts independently of the failed stage; after expiry, reuse a valid matching published row or retrieve the metadata needed to construct a complete replacement pair. Preserve successful shared cache entries, with no partial normalization from failed documents. A worker timeout cannot override a successful fetch of the same resource or create a publication-blocking conflict. Different successful descriptions still conflict.
 
 Required individual refresh failures retain an existing pair, successful verification, associations and cache references. Mark it stale/unavailable. New incomplete records remain inventory-only. Explicit membership removal or exclusion takes precedence. Never admit half a pair. Manifest `complete` describes inventory coverage and complete accounting, not universal retrieval success. Publish inventory-only retry updates.
 

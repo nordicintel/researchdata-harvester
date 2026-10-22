@@ -123,7 +123,7 @@ async def resolve(document, source_url):
             return await resolver.resolve(document, source_url=source_url)
 ```
 
-Use `format="json-schema"` for schemas without `$schema`, including boolean schemas. Missing caches start empty. Vocabulary definitions are reused; requested mutable entities are revalidated. Workers leave published cache files untouched. Build merges updates, rejects conflicts and prunes unreferenced mutable entries. The existing RDF filename also covers non-RDF definitions.
+Use `format="json-schema"` for schemas without `$schema`, including boolean schemas. Missing caches start empty. Vocabulary definitions are reused; requested mutable entities are revalidated. Workers leave published cache files untouched. Build merges updates, prefers a successful fetch over a failed worker fetch of the same resource, rejects conflicting successful descriptions and prunes unreferenced mutable entries. The existing RDF filename also covers non-RDF definitions.
 
 ## Configuration
 

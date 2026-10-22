@@ -251,6 +251,28 @@ def test_cache_creation_merge_pruning_and_atomic_save(tmp_path: Path, monkeypatc
     with pytest.raises(ValueError, match="Conflicting"):
         cache.merge(conflict)
     assert cache.changes() == before
+    unavailable = {
+        "https://example.org/entity": {
+            **update["https://example.org/entity"],
+            "outcome": "unavailable",
+            "error": "ReadTimeout",
+            "retry": True,
+        }
+    }
+    for order in ((update, unavailable), (unavailable, update)):
+        merged = RdfCache()
+        merged.merge(*order)
+        assert merged.changes()["https://example.org/entity"]["outcome"] == "available"
+        assert merged.changes()["https://example.org/entity"]["data"] == {"label": "Mätning"}
+    other_failure = {
+        "https://example.org/entity": {
+            **unavailable["https://example.org/entity"],
+            "error": "HTTP 503",
+        }
+    }
+    merged = RdfCache()
+    merged.merge(unavailable, other_failure)
+    assert merged.changes()["https://example.org/entity"]["retry"] is True
     cache.save(path)
     original = path.read_bytes()
     modified = path.stat().st_mtime_ns
