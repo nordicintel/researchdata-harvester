@@ -315,7 +315,10 @@ def table_sample(data: bytes, url: str, media: str, config: Config) -> tuple[str
                 workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
                 try:
                     for sheet in workbook:
-                        sheet_rows = list(sheet.iter_rows(max_row=count + 1, values_only=True))
+                        try:
+                            sheet_rows = list(sheet.iter_rows(max_row=count + 1, values_only=True))
+                        except TypeError as error:
+                            raise ValueError(f"Unreadable XLSX worksheet: {error}") from error
                         if len(sheet_rows) > 1:
                             return "xlsx", [str(x) for x in sheet_rows[0]], [list(row) for row in sheet_rows[1:]]
                 finally:
